@@ -1,0 +1,9 @@
+[project]
+name = "ai-agentic-analysis"
+version = "0.1.0"
+description = "Harness for measuring how well an agentic coding assistant performs HEP physics analysis tasks, with results tracked in MLflow"
+requires-python = ">=3.13"
+dependencies = [
+    "mlflow>=3.16.0",
+    "python-dotenv>=1.2.3",
+]
