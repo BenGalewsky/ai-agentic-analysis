@@ -1,0 +1,30 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Trial artifacts (workspaces, streams, agent outputs)
+trials/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+
+# MLflow local fallback store
+mlruns/
+mlartifacts/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
