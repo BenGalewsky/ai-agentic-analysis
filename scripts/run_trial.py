@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +31,7 @@ import mlflow
 from dotenv import load_dotenv
 from mlflow.entities import SpanStatusCode, SpanType
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(".")
 SKILLS_DIR = PROJECT_ROOT / "skills"
 DEFAULT_TRIALS_DIR = Path(
     os.environ.get("TRIAL_WORKSPACE_ROOT")
@@ -39,7 +40,10 @@ DEFAULT_TRIALS_DIR = Path(
 
 DEFAULT_EXPERIMENT = "hep-plot-agent"
 DEFAULT_PROMPT = "TopQuark"
-DEFAULT_ALLOWED_TOOLS = "Bash Read Write Edit Glob Grep Skill WebFetch WebSearch TodoWrite"
+DEFAULT_ALLOWED_TOOLS = (
+    "Bash Read Write Edit Glob Grep Skill WebFetch WebSearch TodoWrite mcp__af"
+)
+DEFAULT_MCP_CONFIG = Path(__file__).resolve().parent / "mcp.json"
 
 SCRIPT_SUFFIXES = (".py",)
 PLOT_SUFFIXES = (".png", ".pdf", ".jpg", ".jpeg", ".svg")
@@ -124,6 +128,13 @@ def build_command(args: argparse.Namespace) -> list[str]:
         args.permission_mode,
         "--no-session-persistence",
     ]
+    for config in args.mcp_config:
+        # The agent runs in a staged workspace, so relative paths from the repo
+        # root would not resolve; inline JSON strings are passed through as-is.
+        value = config if config.lstrip().startswith("{") else str(Path(config).resolve())
+        cmd += ["--mcp-config", value]
+    if args.strict_mcp_config:
+        cmd.append("--strict-mcp-config")
     if args.allowed_tools:
         cmd += ["--allowed-tools", args.allowed_tools]
     if args.model:
@@ -131,6 +142,37 @@ def build_command(args: argparse.Namespace) -> list[str]:
     if args.max_budget_usd:
         cmd += ["--max-budget-usd", str(args.max_budget_usd)]
     return cmd
+
+
+def read_mcp_config(config: str) -> str:
+    return config if config.lstrip().startswith("{") else Path(config).read_text()
+
+
+def mcp_server_names(configs: list[str]) -> list[str]:
+    """Server names declared across the MCP configs, for logging/provenance."""
+    names: list[str] = []
+    for config in configs:
+        names += list(json.loads(read_mcp_config(config)).get("mcpServers", {}))
+    return sorted(set(names))
+
+
+def check_mcp_env(configs: list[str]) -> None:
+    """Fail before launch on an unset ``${VAR}`` in a config.
+
+    Claude Code passes an unexpanded placeholder through verbatim, so a missing
+    token surfaces only as an authentication failure once the trial is running.
+    """
+    missing = {
+        name
+        for config in configs
+        for name, default in re.findall(r"\$\{(\w+)(:-[^}]*)?\}", read_mcp_config(config))
+        if not default and name not in os.environ
+    }
+    if missing:
+        raise SystemExit(
+            f"MCP config needs unset environment variable(s): {', '.join(sorted(missing))} "
+            "(expected in .env)"
+        )
 
 
 def run_claude(
@@ -288,6 +330,23 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TRIALS_DIR,
         help="Where trial workspaces are staged (default: $TRIAL_WORKSPACE_ROOT or ~/.cache/hep-agent-trials)",
     )
+    parser.add_argument(
+        "--mcp-config",
+        action="append",
+        default=None,
+        metavar="PATH_OR_JSON",
+        help=f"MCP server config file or inline JSON (repeatable, default: {DEFAULT_MCP_CONFIG})",
+    )
+    parser.add_argument(
+        "--no-mcp",
+        action="store_true",
+        help="Run without any --mcp-config (the default config is skipped)",
+    )
+    parser.add_argument(
+        "--strict-mcp-config",
+        action="store_true",
+        help="Ignore user/project MCP settings, so only --mcp-config servers are loaded",
+    )
     parser.add_argument("--timeout", type=int, default=3600, help="Subprocess timeout in seconds")
     parser.add_argument("--max-budget-usd", type=float, default=None)
     return parser.parse_args()
@@ -303,6 +362,13 @@ def main() -> int:
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(args.experiment)
 
+    if args.no_mcp:
+        args.mcp_config = []
+    elif args.mcp_config is None:
+        args.mcp_config = [str(DEFAULT_MCP_CONFIG)] if DEFAULT_MCP_CONFIG.exists() else []
+
+    check_mcp_env(args.mcp_config)
+
     variables = dict(v.split("=", 1) for v in args.var)
     prompt = resolve_prompt(args.prompt, args.prompt_version)
     prompt_text = render_prompt(prompt, variables)
@@ -316,6 +382,8 @@ def main() -> int:
     cmd = build_command(args)
     print(f"prompt   : {prompt.name} v{prompt.version}")
     print(f"skills   : {', '.join(skill_names)} ({skills_hash})")
+    if args.mcp_config:
+        print(f"mcp      : {', '.join(mcp_server_names(args.mcp_config))}")
     print(f"workspace: {workspace}")
 
     run_name = args.run_name or f"{prompt.name}-v{prompt.version}-{stamp}"
@@ -328,12 +396,18 @@ def main() -> int:
                 "model": args.model or "default",
                 "permission_mode": args.permission_mode,
                 "allowed_tools": args.allowed_tools,
+                "mcp_config": ",".join(args.mcp_config),
+                "mcp_servers": ",".join(mcp_server_names(args.mcp_config)),
+                "strict_mcp_config": args.strict_mcp_config,
                 "skills_hash": skills_hash,
                 "skills": ",".join(skill_names),
                 "num_skills": len(skill_names),
             }
         )
         mlflow.log_text(prompt_text, "prompt.txt")
+        for i, config in enumerate(args.mcp_config):
+            raw = config if config.lstrip().startswith("{") else Path(config).read_text()
+            mlflow.log_text(raw, f"mcp_config_{i}.json" if i else "mcp_config.json")
         mlflow.log_artifacts(str(SKILLS_DIR), artifact_path="skills")
 
         stream_path = trial_dir / "claude_stream.jsonl"

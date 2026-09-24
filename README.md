@@ -45,6 +45,44 @@ cp .env.example .env
 
 `.env` is gitignored — keep credentials out of the repo.
 
+## MCP servers
+
+`scripts/mcp.json` declares the MCP servers the agent gets in every trial, and
+the harness passes it to `claude` with `--mcp-config`. It currently holds the
+UChicago Analysis Facility server, authenticated with a personal access token:
+
+```json
+{
+  "mcpServers": {
+    "af": {
+      "type": "http",
+      "url": "https://mcp.af.uchicago.edu/mcp/",
+      "headers": { "Authorization": "Bearer ${MCP_BEARER_TOKEN}" }
+    }
+  }
+}
+```
+
+A trial runs headless and cannot complete the browser OAuth flow, so it uses the
+[static token](https://maniaclab.uchicago.edu/af-mcp-platform/connecting-a-client/)
+route. Mint one at [mcp-portal.af.uchicago.edu/tokens/](https://mcp-portal.af.uchicago.edu/tokens/)
+— it is shown exactly once — and put it in `.env`:
+
+```
+MCP_BEARER_TOKEN=<your-token>
+```
+
+The harness loads `.env` and the subprocess inherits it, so `claude` expands
+`${MCP_BEARER_TOKEN}` at launch. An unset variable is not an error to the CLI —
+it forwards the placeholder verbatim and the server answers 401 — so the harness
+checks for it up front and refuses to start the trial.
+
+The server's tools are named `mcp__af__<tool>`, and `mcp__af` in
+`--allowed-tools` admits all of them. Use `--mcp-config` to point at a different
+config (repeatable, also accepts inline JSON), `--no-mcp` to run without one, and
+`--strict-mcp-config` to ignore whatever MCP servers your user and project
+settings add, so a trial sees only what the config names.
+
 ## Running
 
 ```bash
@@ -64,6 +102,9 @@ Useful options:
 | `--experiment` | MLflow experiment name (default: `hep-plot-agent`) |
 | `--model` | Model alias passed to `claude`, e.g. `opus` |
 | `--allowed-tools` | Tools the agent may use without prompting |
+| `--mcp-config` | MCP config file or inline JSON (repeatable, default: `scripts/mcp.json`) |
+| `--no-mcp` | Run the trial with no MCP servers |
+| `--strict-mcp-config` | Load only the servers in `--mcp-config`, ignoring user/project settings |
 | `--permission-mode` | Defaults to `bypassPermissions` so the trial runs unattended |
 | `--trials-dir` | Where workspaces are staged (default: `$TRIAL_WORKSPACE_ROOT` or `~/.cache/hep-agent-trials`) |
 | `--timeout` | Subprocess timeout in seconds (default: 3600) |
@@ -74,7 +115,8 @@ The script exits non-zero when the trial fails, so it composes into a sweep.
 ## What gets recorded
 
 **Params** — prompt name/version/URI, model, permission mode, allowed tools, the
-skill list and its content hash.
+MCP config path and the server names it declares, the skill list and its content
+hash.
 
 **Metrics** — wall time, API duration, turns, cost in USD, input/output/cache
 tokens, tool-call count, `completed`, and whether a script and a plot were
