@@ -13,15 +13,19 @@ every run, trials stay comparable as both evolve.
 
 ## How a trial works
 
-`run_trial.py` performs one trial end to end:
+`scripts/run_trial.py` performs one trial end to end:
 
-1. Loads a prompt version from the MLflow Prompt Registry (default: `TopQuark`,
+1. Loads a prompt version from the MLflow Prompt Registry (default: `IRIS-HEP`,
    latest version).
-2. Stages a clean workspace and copies `skills/` into it as `.claude/skills`.
-3. Runs `claude --print` in that workspace as a subprocess, streaming JSON events
-   to the console and to `claude_stream.jsonl`.
-4. Logs params, metrics, artifacts and an MLflow trace (one child span per tool
-   call) back to the tracking server.
+2. Loads the questions from the `hep-data-llm-questions` MLflow evaluation
+   dataset, which `scripts/register_questions.py` populates.
+3. For each question, renders the prompt with the record's `inputs` (the
+   `{{ question }}` variable), stages a clean workspace with `skills/` copied in
+   as `.claude/skills`, and runs `claude --print` there as a subprocess,
+   streaming JSON events to the console and to `claude_stream.jsonl`.
+4. Logs each question as a child run — params, metrics, artifacts and an MLflow
+   trace (one child span per tool call) — under a parent run for the whole
+   trial, which carries the aggregate completion rate and cost.
 
 Deliverables — the most recently modified `.py` and the most recently modified
 image — are promoted to the `final/` artifact path, so a plot is always in the
@@ -85,20 +89,30 @@ settings add, so a trial sees only what the config names.
 
 ## Running
 
+Run every question in the dataset:
+
 ```bash
-uv run run_trial.py
+uv run scripts/run_trial.py
+```
+
+Run a single question, by name or `question_index`:
+
+```bash
+uv run scripts/run_trial.py --question JetPtAll
 ```
 
 ```bash
-uv run run_trial.py --prompt TopQuark --prompt-version 1 --model opus
+uv run scripts/run_trial.py --prompt IRIS-HEP --prompt-version 1 --model opus
 ```
 
 Useful options:
 
 | Option | Purpose |
 | --- | --- |
-| `--prompt` / `--prompt-version` | Which registered prompt to run (default: latest `TopQuark`) |
-| `--var KEY=VALUE` | Fill a prompt template variable (repeatable) |
+| `--prompt` / `--prompt-version` | Which registered prompt to run (default: latest `IRIS-HEP`) |
+| `--dataset` | Evaluation dataset of questions (default: `hep-data-llm-questions`) |
+| `--question` | Run only this question, by its `name` tag or `question_index` |
+| `--var KEY=VALUE` | Fill a prompt template variable (repeatable, overrides the dataset's inputs) |
 | `--experiment` | MLflow experiment name (default: `hep-plot-agent`) |
 | `--model` | Model alias passed to `claude`, e.g. `opus` |
 | `--allowed-tools` | Tools the agent may use without prompting |
@@ -108,23 +122,27 @@ Useful options:
 | `--permission-mode` | Defaults to `bypassPermissions` so the trial runs unattended |
 | `--trials-dir` | Where workspaces are staged (default: `$TRIAL_WORKSPACE_ROOT` or `~/.cache/hep-agent-trials`) |
 | `--timeout` | Subprocess timeout in seconds (default: 3600) |
-| `--max-budget-usd` | Cap the spend on a single trial |
+| `--max-budget-usd` | Cap the spend on each question |
 
-The script exits non-zero when the trial fails, so it composes into a sweep.
+The script exits non-zero when any question fails, so it composes into a sweep.
 
 ## What gets recorded
 
-**Params** — prompt name/version/URI, model, permission mode, allowed tools, the
-MCP config path and the server names it declares, the skill list and its content
-hash.
+**Params** — prompt name/version/URI, dataset name and ID, model, permission
+mode, allowed tools, the MCP config path and the server names it declares, the
+skill list and its content hash. Question runs add the question name, index and
+dataset record ID.
 
-**Metrics** — wall time, API duration, turns, cost in USD, input/output/cache
-tokens, tool-call count, `completed`, and whether a script and a plot were
-produced.
+**Metrics** — per question: wall time, API duration, turns, cost in USD,
+input/output/cache tokens, tool-call count, `completed`, and whether a script and
+a plot were produced. The parent run totals these as `num_completed`,
+`completion_rate`, `num_produced_plot`, `total_cost_usd` and `wall_seconds`.
 
-**Artifacts** — the rendered prompt, a snapshot of `skills/`, the raw event
-stream, `result.json`, stderr, the agent's final message, everything it wrote
-under `outputs/`, and the promoted `final/` deliverables.
+**Artifacts** — the parent run holds the prompt template, the MCP config and a
+snapshot of `skills/`. Each question run holds the rendered prompt, the record's
+`inputs.json` and `expectations.json`, the raw event stream, `result.json`,
+stderr, the agent's final message, everything it wrote under `outputs/`, and the
+promoted `final/` deliverables.
 
 **Trace** — the trial as a single agent span with a tool span per call, so a run
 can be replayed in the MLflow UI.
@@ -149,7 +167,9 @@ before and after a skill change.
 ## Layout
 
 ```
-run_trial.py    # the harness
+scripts/
+  run_trial.py           # the harness
+  register_questions.py  # loads the benchmark questions into the MLflow dataset
 skills/         # domain skills staged into every trial workspace
 trials/         # local trial output (gitignored)
 ```
