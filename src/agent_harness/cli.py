@@ -20,11 +20,9 @@ Example:
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 import mlflow
-from dotenv import load_dotenv
 
 from .config import (
     DEFAULT_ALLOWED_TOOLS,
@@ -33,7 +31,7 @@ from .config import (
     DEFAULT_MCP_CONFIG,
     DEFAULT_PROMPT,
     DEFAULT_TRIALS_DIR,
-    PROJECT_ROOT,
+    connect_mlflow,
 )
 from .mcp_config import check_mcp_env
 from .prompts import render_prompt, resolve_prompt
@@ -137,12 +135,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    load_dotenv(PROJECT_ROOT / ".env")
-
-    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
-    if not tracking_uri:
-        raise SystemExit("MLFLOW_TRACKING_URI is not set (expected in .env)")
-    mlflow.set_tracking_uri(tracking_uri)
+    tracking_uri = connect_mlflow()
     mlflow.set_experiment(args.experiment)
 
     if args.no_mcp:

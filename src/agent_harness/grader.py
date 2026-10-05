@@ -31,22 +31,20 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-import mlflow
-from dotenv import load_dotenv
 from mlflow.entities import Feedback, SpanType
 from mlflow.genai.scorers import scorer
 
-from .config import PROJECT_ROOT
+from .config import DEFAULT_DATASET, STREAM_FILE, connect_mlflow
+from .questions import load_questions, question_name
+from .stream import parse_event, tool_results
 
 DEFAULT_TOLERANCE = 0.01
-DEFAULT_DATASET = "hep-data-llm-questions"
 
 # Same grammar as hep-data-llm's ``extract_metrics``, so the two harnesses agree on
 # what counts as a METRIC line. An f-string template such as
@@ -91,24 +89,12 @@ def last_metrics(outputs: list[Any]) -> list[Metric]:
 
 def metrics_from_events(events: list[dict[str, Any]]) -> list[Metric]:
     """METRIC lines from a Claude Code ``stream-json`` event list."""
-    outputs = [
-        block.get("content")
-        for event in events
-        if event.get("type") == "user"
-        for block in event.get("message", {}).get("content", []) or []
-        if isinstance(block, dict) and block.get("type") == "tool_result"
-    ]
-    return last_metrics(outputs)
+    return last_metrics([block.get("content") for block in tool_results(events)])
 
 
 def metrics_from_stream(path: Path) -> list[Metric]:
-    events = []
-    for line in path.read_text().splitlines():
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return metrics_from_events(events)
+    lines = path.read_text().splitlines()
+    return metrics_from_events([e for line in lines if (e := parse_event(line)) is not None])
 
 
 # --------------------------------------------------------------------------- #
@@ -248,10 +234,10 @@ def question_dirs(paths: list[Path]) -> list[Path]:
     """Accept question or repeat directories, or trial directories holding several."""
     found = []
     for path in paths:
-        if (path / "claude_stream.jsonl").exists():
+        if (path / STREAM_FILE).exists():
             found.append(path)
         else:
-            streams = [*path.glob("*/claude_stream.jsonl"), *path.glob("*/*/claude_stream.jsonl")]
+            streams = [*path.glob(f"*/{STREAM_FILE}"), *path.glob(f"*/*/{STREAM_FILE}")]
             found += sorted(p.parent for p in streams)
     return found
 
@@ -266,10 +252,9 @@ def run_label(qdir: Path) -> str:
 
 
 def load_expectations(dataset_name: str) -> dict[str, dict[str, Any]]:
-    from mlflow.genai.datasets import get_dataset
-
-    records = get_dataset(name=dataset_name).to_df().to_dict("records")
-    return {(r["tags"] or {}).get("name"): r["expectations"] for r in records}
+    """Each record's expectations, keyed by the name its trial directory is given."""
+    _, records = load_questions(dataset_name)
+    return {question_name(r): r["expectations"] for r in records}
 
 
 def format_grade(name: str, result: Grade) -> str:
@@ -298,15 +283,12 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="Print grades as JSON")
     args = ap.parse_args()
 
-    load_dotenv(PROJECT_ROOT / ".env")
-    if not os.environ.get("MLFLOW_TRACKING_URI"):
-        raise SystemExit("MLFLOW_TRACKING_URI is not set (expected in .env)")
-    mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+    connect_mlflow()
     expectations = load_expectations(args.dataset)
 
     dirs = question_dirs(args.paths)
     if not dirs:
-        raise SystemExit("No claude_stream.jsonl found under the given paths")
+        raise SystemExit(f"No {STREAM_FILE} found under the given paths")
 
     grades = {}
     for qdir in dirs:
@@ -316,7 +298,7 @@ def main() -> int:
             continue
         grades[run_label(qdir)] = grade(
             expectations[name],
-            metrics_from_stream(qdir / "claude_stream.jsonl"),
+            metrics_from_stream(qdir / STREAM_FILE),
             args.tolerance,
             args.check_avg_entries,
         )
@@ -328,7 +310,6 @@ def main() -> int:
             print(format_grade(name, result))
         print(f"\n{sum(g.passed for g in grades.values())}/{len(grades)} passed")
     return 0 if grades and all(g.passed for g in grades.values()) else 1
-
 
 
 if __name__ == "__main__":

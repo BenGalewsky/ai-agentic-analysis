@@ -2,19 +2,36 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
+from collections.abc import Iterator
 from typing import Any
 
 
-def tool_blocks(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Flatten ``tool_use`` blocks and pair them with their results."""
-    results: dict[str, Any] = {}
+def parse_event(line: str) -> dict[str, Any] | None:
+    """One ``stream-json`` line as an event; ``None`` for a blank or non-JSON line."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def tool_results(events: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """The ``tool_result`` blocks of the user turns, in order."""
     for event in events:
         if event.get("type") != "user":
             continue
         for block in event.get("message", {}).get("content", []) or []:
             if isinstance(block, dict) and block.get("type") == "tool_result":
-                results[block.get("tool_use_id")] = block.get("content")
+                yield block
+
+
+def tool_blocks(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten ``tool_use`` blocks and pair them with their results."""
+    results = {block.get("tool_use_id"): block.get("content") for block in tool_results(events)}
 
     calls = []
     for event in events:
@@ -49,16 +66,13 @@ def skill_file_reads(calls: list[dict[str, Any]]) -> int:
 
 def tool_errors(events: list[dict[str, Any]]) -> int:
     """Tool results flagged as errors: failed commands, bad edits, denied calls."""
-    return sum(
-        isinstance(block, dict) and block.get("type") == "tool_result" and bool(block.get("is_error"))
-        for event in events
-        if event.get("type") == "user"
-        for block in event.get("message", {}).get("content", []) or []
-    )
+    return sum(bool(block.get("is_error")) for block in tool_results(events))
+
+
+def result_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """The final ``result`` event, or ``{}`` when the run ended without one."""
+    return next((e for e in reversed(events) if e.get("type") == "result"), {})
 
 
 def final_text(events: list[dict[str, Any]]) -> str:
-    for event in reversed(events):
-        if event.get("type") == "result":
-            return event.get("result") or ""
-    return ""
+    return result_event(events).get("result") or ""

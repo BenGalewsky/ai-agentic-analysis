@@ -8,8 +8,13 @@ import re
 from pathlib import Path
 
 
+def is_inline_json(config: str) -> bool:
+    """Whether an ``--mcp-config`` value is a JSON string rather than a file path."""
+    return config.lstrip().startswith("{")
+
+
 def read_mcp_config(config: str) -> str:
-    return config if config.lstrip().startswith("{") else Path(config).read_text()
+    return config if is_inline_json(config) else Path(config).read_text()
 
 
 def mcp_server_names(configs: list[str]) -> list[str]:
