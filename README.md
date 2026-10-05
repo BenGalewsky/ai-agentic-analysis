@@ -170,13 +170,21 @@ logged trace's tool spans, so `mlflow.genai.evaluate` can rescore stored traces.
 
 ## What gets recorded
 
+**Tags** — every run carries `run_type`: `trial` on the parent run, `question` on
+each question run. To see only the trials, for example to chart their rollups
+side by side, filter the runs with:
+
+```
+tags.run_type = 'trial'
+```
+
 **Params** — prompt name/version/URI, dataset name and ID, model, permission
 mode, allowed tools, the MCP config path and the server names it declares, the
 skill list and its content hash. Question runs add the question name, index and
 dataset record ID.
 
-**Metrics** — per question: wall time, API duration, turns, cost in USD,
-input/output/cache tokens, tool-call count, `num_tool_errors` (tool results
+**Metrics** — per question: `wall_seconds`, `duration_ms`, `api_duration_ms`,
+`num_turns`, `cost_usd`, input/output/cache tokens, tool-call count, `num_tool_errors` (tool results
 flagged as errors), `completed`, and whether a script and a plot were produced.
 Skill usage is counted as `num_skill_calls` (invocations of the `Skill` tool),
 `skill_calls_<skill>` for each skill, and `num_skill_file_reads` (`Read` calls on
@@ -189,11 +197,13 @@ change — compare at a glance:
 
 | Group | Metrics |
 | --- | --- |
-| Outcomes | `accuracy`, `completion_rate`, `script_rate`, `plot_rate`, `plot_accuracy` (reference plots matched, giving partial credit on multi-plot questions), plus the `num_*` counts behind them |
-| Cost and effort | `total_cost_usd`, `mean_cost_usd`, `cost_per_correct_usd`, `wall_seconds`, `mean_wall_seconds`, `mean_turns`, `mean_tool_calls`, `mean_tool_errors`, `tool_error_rate`, total input/output/cache tokens |
-| Skill usage | `skill_usage_rate` (share of questions that invoked any skill), `num_skill_calls`, `mean_skill_calls`, `num_distinct_skills_used`, `num_skill_file_reads`, `skill_calls_<skill>` |
+| Outcomes | `accuracy`, `completion_rate`, `script_rate`, `plot_rate`, `plot_accuracy` (reference plots matched, giving partial credit on multi-plot questions), plus the counts behind them: `total_completed`, `total_correct`, `total_produced_script`, `total_produced_plot`, `total_plots_expected`, `total_plots_matched` |
+| Cost and effort | `cost_per_correct_usd`, `tool_error_rate`, and `total_` and `mean_` of `cost_usd`, `wall_seconds`, `duration_ms`, `api_duration_ms`, `turns`, `tool_calls` and `tool_errors`; `total_` input/output/cache tokens |
+| Skill usage | `skill_usage_rate` (share of questions that invoked any skill), `total_skill_calls`, `mean_skill_calls`, `num_distinct_skills_used`, `total_skill_file_reads`, `total_skill_calls_<skill>` |
 
-Rates and means compare across trials with different numbers of questions.
+Rates and means compare across trials with different numbers of questions. A
+rollup never reuses a question run's metric name, so each chart in the MLflow UI
+holds one kind of value whether it shows trial runs, question runs or both.
 `plot_accuracy`, `cost_per_correct_usd` and `tool_error_rate` are left out when
 their denominator is zero. The parent run also logs `questions.json`, a table
 with one row per question, for side-by-side comparison in the MLflow UI.

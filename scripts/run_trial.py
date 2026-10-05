@@ -464,7 +464,7 @@ def run_question(
     workspace = stage_workspace(question_dir)
     print(f"workspace: {workspace}")
 
-    with mlflow.start_run(run_name=name, nested=True) as run:
+    with mlflow.start_run(run_name=name, nested=True, tags={"run_type": "question"}) as run:
         mlflow.log_params(
             {
                 **common_params,
@@ -502,7 +502,7 @@ def run_question(
                 "duration_ms": result.get("duration_ms", 0),
                 "api_duration_ms": result.get("duration_api_ms", 0),
                 "num_turns": result.get("num_turns", 0),
-                "total_cost_usd": result.get("total_cost_usd", 0.0),
+                "cost_usd": result.get("total_cost_usd", 0.0),
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
                 "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
@@ -611,6 +611,8 @@ def run_question(
         "plots_matched": plots_matched,
         "cost": cost,
         "wall_seconds": wall_seconds,
+        "duration_ms": result.get("duration_ms", 0) or 0,
+        "api_duration_ms": result.get("duration_api_ms", 0) or 0,
         "num_turns": result.get("num_turns", 0) or 0,
         "num_tool_calls": len(calls),
         "num_tool_errors": tool_errors(events),
@@ -641,6 +643,8 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
 
     Rates and means are what compare across trials of different sizes, e.g. a
     skills revision run over a subset of the questions; totals are kept for cost.
+    A rollup never reuses a question run's metric key - it is prefixed `total_` or
+    `mean_` - so a chart of a key holds one kind of value, whichever runs are shown.
     """
     n = len(summaries)
 
@@ -657,36 +661,43 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
 
     metrics = {
         # Outcomes
-        "num_completed": total("succeeded"),
+        "total_completed": total("succeeded"),
         "completion_rate": mean("succeeded"),
-        "num_correct": num_correct,
+        "total_correct": num_correct,
         "accuracy": mean("correct"),
-        "num_produced_script": total("produced_script"),
+        "total_produced_script": total("produced_script"),
         "script_rate": mean("produced_script"),
-        "num_produced_plot": total("produced_plot"),
+        "total_produced_plot": total("produced_plot"),
         "plot_rate": mean("produced_plot"),
-        "num_plots_expected": plots_expected,
-        "num_plots_matched": total("plots_matched"),
+        "total_plots_expected": plots_expected,
+        "total_plots_matched": total("plots_matched"),
         # Cost and effort
         "total_cost_usd": total("cost"),
         "mean_cost_usd": mean("cost"),
-        "wall_seconds": total("wall_seconds"),
+        "total_wall_seconds": total("wall_seconds"),
         "mean_wall_seconds": mean("wall_seconds"),
+        "total_duration_ms": total("duration_ms"),
+        "mean_duration_ms": mean("duration_ms"),
+        "total_api_duration_ms": total("api_duration_ms"),
+        "mean_api_duration_ms": mean("api_duration_ms"),
+        "total_turns": total("num_turns"),
         "mean_turns": mean("num_turns"),
+        "total_tool_calls": tool_calls,
         "mean_tool_calls": mean("num_tool_calls"),
+        "total_tool_errors": total("num_tool_errors"),
         "mean_tool_errors": mean("num_tool_errors"),
-        "input_tokens": total("input_tokens"),
-        "output_tokens": total("output_tokens"),
-        "cache_read_tokens": total("cache_read_tokens"),
-        "cache_creation_tokens": total("cache_creation_tokens"),
+        "total_input_tokens": total("input_tokens"),
+        "total_output_tokens": total("output_tokens"),
+        "total_cache_read_tokens": total("cache_read_tokens"),
+        "total_cache_creation_tokens": total("cache_creation_tokens"),
         # Skill usage
-        "num_skill_calls": skills_used.total(),
+        "total_skill_calls": skills_used.total(),
         "mean_skill_calls": skills_used.total() / n,
         "skill_usage_rate": fmean(bool(s["skill_calls"]) for s in summaries),
         "num_distinct_skills_used": len(skills_used),
-        "num_skill_file_reads": total("num_skill_file_reads"),
+        "total_skill_file_reads": total("num_skill_file_reads"),
         **{
-            f"skill_calls_{skill}": skills_used[skill]
+            f"total_skill_calls_{skill}": skills_used[skill]
             for skill in sorted({*skill_names, *skills_used})
         },
     }
@@ -777,7 +788,8 @@ def main() -> int:
     }
 
     run_name = args.run_name or f"{prompt.name}-v{prompt.version}-{stamp}"
-    with mlflow.start_run(run_name=run_name) as run:
+    # Tagged so the trial runs filter out with `tags.run_type = 'trial'`.
+    with mlflow.start_run(run_name=run_name, tags={"run_type": "trial"}) as run:
         mlflow.log_params(
             {
                 **common_params,
@@ -803,7 +815,7 @@ def main() -> int:
         metrics = trial_metrics(summaries, skill_names)
         mlflow.log_metrics(metrics)
         mlflow.log_table(summary_table(summaries), artifact_file="questions.json")
-        num_completed, num_correct = metrics["num_completed"], metrics["num_correct"]
+        num_completed, num_correct = metrics["total_completed"], metrics["total_correct"]
         total_cost = metrics["total_cost_usd"]
         all_succeeded = num_completed == len(summaries)
         mlflow.set_tag("status", "success" if all_succeeded else "failure")
@@ -813,7 +825,7 @@ def main() -> int:
             f"{num_correct}/{len(summaries)} correct)"
         )
         print(
-            f"skills   : {metrics['num_skill_calls']} call(s), used in "
+            f"skills   : {metrics['total_skill_calls']} call(s), used in "
             f"{metrics['skill_usage_rate']:.0%} of questions"
         )
         for s in summaries:
