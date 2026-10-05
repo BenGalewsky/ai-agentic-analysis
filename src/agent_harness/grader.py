@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Grade a trial's plots against the expectations of its ``hep-data-llm-questions`` record.
 
 The prompt has the agent's script print one line per plot describing the values it
@@ -20,8 +19,8 @@ still reported, and ``--check-avg-entries`` gates on it too.
 
 Regrade trials already on disk, taking expectations from the dataset:
 
-    uv run scripts/grader.py ~/.cache/hep-agent-trials/20261005T071912Z-IRIS-HEP-v1
-    uv run scripts/grader.py <trial_dir>/JetPtAll --tolerance 0.005
+    uv run grade-trial ~/.cache/hep-agent-trials/20261005T071912Z-IRIS-HEP-v1
+    uv run grade-trial <trial_dir>/JetPtAll --tolerance 0.005
 
 A trial run with ``--repeats`` nests each repeat as ``<question>/r<k>/``; those are
 found under a trial or question directory and graded against ``<question>``.
@@ -43,6 +42,8 @@ import mlflow
 from dotenv import load_dotenv
 from mlflow.entities import Feedback, SpanType
 from mlflow.genai.scorers import scorer
+
+from .config import PROJECT_ROOT
 
 DEFAULT_TOLERANCE = 0.01
 DEFAULT_DATASET = "hep-data-llm-questions"
@@ -223,7 +224,7 @@ def grade(
 # --------------------------------------------------------------------------- #
 @scorer
 def metrics_match(trace, expectations) -> Feedback:
-    """``mlflow.genai.evaluate`` scorer over traces logged by ``run_trial.py``.
+    """``mlflow.genai.evaluate`` scorer over traces logged by ``run-trial``.
 
     Reads the METRIC lines from the trace's tool spans, so stored trials can be
     rescored without rerunning the agent.
@@ -297,7 +298,7 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="Print grades as JSON")
     args = ap.parse_args()
 
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    load_dotenv(PROJECT_ROOT / ".env")
     if not os.environ.get("MLFLOW_TRACKING_URI"):
         raise SystemExit("MLFLOW_TRACKING_URI is not set (expected in .env)")
     mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
@@ -327,6 +328,7 @@ def main() -> int:
             print(format_grade(name, result))
         print(f"\n{sum(g.passed for g in grades.values())}/{len(grades)} passed")
     return 0 if grades and all(g.passed for g in grades.values()) else 1
+
 
 
 if __name__ == "__main__":

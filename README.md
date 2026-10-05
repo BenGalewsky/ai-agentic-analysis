@@ -13,7 +13,7 @@ every run, trials stay comparable as both evolve.
 
 ## How a trial works
 
-`scripts/run_trial.py` performs one trial end to end:
+`uv run run-trial` performs one trial end to end:
 
 1. Loads a prompt version from the MLflow Prompt Registry (default: `IRIS-HEP`,
    latest version).
@@ -42,6 +42,10 @@ Requires Python 3.13+, [uv](https://docs.astral.sh/uv/), and the
 uv sync
 ```
 
+This installs the harness package (`src/agent_harness/`) and its `run-trial` and
+`grade-trial` commands. Run them from the repo root, since `skills/`, `mcp.json`
+and `.env` are found relative to the working directory.
+
 Point the harness at your MLflow tracking server by copying `.env.example` to
 `.env` and filling in the URI:
 
@@ -53,7 +57,7 @@ cp .env.example .env
 
 ## MCP servers
 
-`scripts/mcp.json` declares the MCP servers the agent gets in every trial, and
+`mcp.json` declares the MCP servers the agent gets in every trial, and
 the harness passes it to `claude` with `--mcp-config`. It currently holds the
 UChicago Analysis Facility server, authenticated with a personal access token:
 
@@ -94,31 +98,31 @@ settings add, so a trial sees only what the config names.
 Run every question in the dataset:
 
 ```bash
-uv run scripts/run_trial.py
+uv run run-trial
 ```
 
 Run a single question, by name or `question_index`:
 
 ```bash
-uv run scripts/run_trial.py --question JetPtAll
+uv run run-trial --question JetPtAll
 ```
 
 Run a few questions while developing, in a separate experiment so the benchmark
 results stay clean:
 
 ```bash
-uv run scripts/run_trial.py --question JetPtAll --question 2 --experiment hep-plot-agent-dev
-uv run scripts/run_trial.py --limit 2 --experiment hep-plot-agent-dev
+uv run run-trial --question JetPtAll --question 2 --experiment hep-plot-agent-dev
+uv run run-trial --limit 2 --experiment hep-plot-agent-dev
 ```
 
 Run each question several times, to see how consistently the agent gets it right:
 
 ```bash
-uv run scripts/run_trial.py --question JetPtAll --repeats 5
+uv run run-trial --question JetPtAll --repeats 5
 ```
 
 ```bash
-uv run scripts/run_trial.py --prompt IRIS-HEP --prompt-version 1 --model opus
+uv run run-trial --prompt IRIS-HEP --prompt-version 1 --model opus
 ```
 
 Useful options:
@@ -135,7 +139,7 @@ Useful options:
 | `--run-name` | Name of the parent trial run (default: `<prompt>-v<version>-<timestamp>`) |
 | `--model` | Model alias passed to `claude`, e.g. `opus` |
 | `--allowed-tools` | Tools the agent may use without prompting |
-| `--mcp-config` | MCP config file or inline JSON (repeatable, default: `scripts/mcp.json`) |
+| `--mcp-config` | MCP config file or inline JSON (repeatable, default: `mcp.json`) |
 | `--no-mcp` | Run the trial with no MCP servers |
 | `--strict-mcp-config` | Load only the servers in `--mcp-config`, ignoring user/project settings |
 | `--permission-mode` | Defaults to `bypassPermissions` so the trial runs unattended |
@@ -161,8 +165,8 @@ filled the histogram with, in hep-data-llm's format:
 METRIC: avg_entries_per_event=<N> mean=<M>
 ```
 
-`scripts/grader.py` reads those lines from the last tool call that printed any (the
-agent's final run of its script) and passes the question when there are exactly
+The grader (`agent_harness/grader.py`) reads those lines from the last tool call
+that printed any (the agent's final run of its script) and passes the question when there are exactly
 `n_plots` of them and each reference plot is matched, one-to-one and in any order,
 by a line whose `mean` is within 1%. As in hep-data-llm, `avg_entries_per_event` is
 reported but not gated, since there are several valid ways to count entries.
@@ -171,14 +175,14 @@ The harness grades every question as it runs. To regrade trials already on disk,
 for example with a tighter tolerance:
 
 ```bash
-uv run scripts/grader.py ~/.cache/hep-agent-trials/<trial-dir> --tolerance 0.005
+uv run grade-trial ~/.cache/hep-agent-trials/<trial-dir> --tolerance 0.005
 ```
 
 With `--repeats`, each repeat is staged in `<trial-dir>/<question>/r<k>/`, and
 the grader grades every repeat it finds against `<question>`'s record.
 
-`grader.metrics_match` is also an MLflow scorer that reads the METRIC lines from a
-logged trace's tool spans, so `mlflow.genai.evaluate` can rescore stored traces.
+`agent_harness.grader.metrics_match` is also an MLflow scorer that reads the
+METRIC lines from a logged trace's tool spans, so `mlflow.genai.evaluate` can rescore stored traces.
 
 ## What gets recorded
 
@@ -270,10 +274,18 @@ before and after a skill change.
 ## Layout
 
 ```
+src/agent_harness/       # the harness package
+  cli.py                 # run-trial: options and setup
+  trial.py               # runs the questions and their repeats under one trial run
+  claude.py              # the claude -p subprocess
+  stream.py              # reads tool calls and skill use out of the event stream
+  tracing.py             # MLflow traces
+  rollup.py              # question- and trial-level metrics
+  prompts.py, questions.py, workspace.py, mcp_config.py, config.py
+  grader.py              # grade-trial: scores a trial's METRIC lines against the expectations
 scripts/
-  run_trial.py           # the harness
   register_questions.py  # loads the benchmark questions into the MLflow dataset
-  grader.py              # scores a trial's METRIC lines against the expectations
+mcp.json        # MCP servers the agent gets in every trial
 skills/         # domain skills staged into every trial workspace
 trials/         # local trial output (gitignored)
 ```
