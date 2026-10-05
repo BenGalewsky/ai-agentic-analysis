@@ -205,7 +205,9 @@ promoted `final/` deliverables, and `grade.json` with the per-plot comparison.
 
 **Trace** — the trial as a single agent span with a tool span per call, so a run
 can be replayed in the MLflow UI. The grade is attached to it as a
-`metrics_match` feedback assessment.
+`metrics_match` feedback assessment. Each trace belongs to its question run and
+is also linked to the parent run, so the parent's traces cover the whole trial and
+two trials can be compared trace by trace.
 
 ## Skills
 

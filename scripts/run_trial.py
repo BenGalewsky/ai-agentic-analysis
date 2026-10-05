@@ -568,6 +568,7 @@ def run_question(
         mlflow.set_tags({"grade": "pass" if graded.passed else "fail", "grade_message": graded.message})
         mlflow.log_dict(graded.to_dict(), "grade.json")
 
+        trace_id = None
         if events:
             trace_id = log_trace(prompt_text, events, result)
             # Traces are exported in the background, and the server's auth layer
@@ -597,6 +598,7 @@ def run_question(
     return {
         "name": name,
         "run_id": run.info.run_id,
+        "trace_id": trace_id,
         "succeeded": succeeded,
         "correct": graded.passed,
         "produced_script": "script" in deliverables,
@@ -615,6 +617,19 @@ def run_question(
         "skill_calls": skills_used,
         "num_skill_file_reads": skill_file_reads(calls),
     }
+
+
+def link_traces(trace_ids: list[str], run_id: str) -> None:
+    """Link the question traces to the trial run too, so the trial's traces can be
+    compared across trials. Each trace stays on its question run as well.
+    """
+    client = mlflow.MlflowClient()
+    for start in range(0, len(trace_ids), 100):  # the API takes at most 100 per call
+        chunk = trace_ids[start : start + 100]
+        try:
+            client.link_traces_to_run(chunk, run_id)
+        except MlflowException as e:
+            print(f"warning  : could not link {len(chunk)} trace(s) to the trial run: {e.message}")
 
 
 def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> dict[str, float]:
@@ -780,6 +795,7 @@ def main() -> int:
                 )
             )
 
+        link_traces([s["trace_id"] for s in summaries if s["trace_id"]], run.info.run_id)
         metrics = trial_metrics(summaries, skill_names)
         mlflow.log_metrics(metrics)
         mlflow.log_table(summary_table(summaries), artifact_file="questions.json")
