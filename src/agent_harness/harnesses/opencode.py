@@ -110,7 +110,7 @@ class OpenCode(Harness):
                 stdout=out,
                 stderr=err,
                 text=True,
-                env=agent_env(),
+                env=agent_env() | {"PWD": str(workspace)},
                 start_new_session=True,
             )
             try:
@@ -128,6 +128,9 @@ class OpenCode(Harness):
             reason = "timed out" if proc.returncode == -signal.SIGKILL else problem
             print(f"warning  : could not export opencode session {session_id}: {reason}")
             return []
+        directory = (json.loads(path.read_text()).get("info") or {}).get("location", {}).get("directory")
+        if directory and Path(directory).resolve() != workspace.resolve():
+            print(f"warning  : opencode ran in {directory}, not the workspace {workspace}")
         return [path]
 
     def tool_calls(self, events: list[dict[str, Any]]) -> list[ToolCall]:

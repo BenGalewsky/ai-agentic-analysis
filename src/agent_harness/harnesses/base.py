@@ -191,7 +191,9 @@ class Harness(ABC):
         so a straggler still holding the pipe cannot hold up the trial.
         """
         events: list[dict[str, Any]] = []
-        env = agent_env() | self.env()
+        # opencode takes its working directory from PWD rather than the process's
+        # own, so a PWD inherited from the harness would put the agent in the repo.
+        env = agent_env() | self.env() | {"PWD": str(workspace)}
         timed_out = False
 
         with stream_path.open("w") as stream_file, tempfile.TemporaryFile("w+") as stderr_file:
