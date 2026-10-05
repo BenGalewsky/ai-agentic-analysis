@@ -123,6 +123,7 @@ Useful options:
 | `--limit` | Run only the first N questions, by `question_index` |
 | `--var KEY=VALUE` | Fill a prompt template variable (repeatable, overrides the dataset's inputs) |
 | `--experiment` | MLflow experiment name (default: `hep-plot-agent`) |
+| `--run-name` | Name of the parent trial run (default: `<prompt>-v<version>-<timestamp>`) |
 | `--model` | Model alias passed to `claude`, e.g. `opus` |
 | `--allowed-tools` | Tools the agent may use without prompting |
 | `--mcp-config` | MCP config file or inline JSON (repeatable, default: `scripts/mcp.json`) |

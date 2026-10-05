@@ -401,7 +401,11 @@ def parse_args() -> argparse.Namespace:
         help="Value for a prompt template variable (repeatable; overrides the dataset's inputs)",
     )
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
-    parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Name of the parent trial run (default: <prompt>-v<version>-<timestamp>)",
+    )
     parser.add_argument("--model", default=None, help="Model alias passed to claude, e.g. opus")
     parser.add_argument("--claude-bin", default="claude")
     parser.add_argument(
