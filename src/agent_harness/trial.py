@@ -15,13 +15,20 @@ from mlflow.entities import AssessmentSource, AssessmentSourceType
 from mlflow.exceptions import MlflowException
 
 from .claude import build_command, run_claude
-from .config import SKILLS_DIR
+from .config import SKILLS_DIR, STREAM_FILE
 from .grader import grade, metrics_from_events
 from .mcp_config import mcp_server_names, read_mcp_config
 from .prompts import render_prompt
 from .questions import question_name
 from .rollup import question_metrics, question_tags, summary_table, trial_metrics
-from .stream import final_text, skill_calls, skill_file_reads, tool_blocks, tool_errors
+from .stream import (
+    final_text,
+    result_event,
+    skill_calls,
+    skill_file_reads,
+    tool_blocks,
+    tool_errors,
+)
 from .tracing import link_traces, log_trace
 from .workspace import find_deliverables, hash_skills, stage_workspace
 
@@ -46,7 +53,7 @@ def run_repeat(
     workspace = stage_workspace(repeat_dir)
     print(f"workspace: {workspace}")
 
-    stream_path = repeat_dir / "claude_stream.jsonl"
+    stream_path = repeat_dir / STREAM_FILE
     started = time.time()
     try:
         events, returncode, stderr = run_claude(
@@ -57,7 +64,7 @@ def run_repeat(
         events, returncode, stderr, timed_out = [], -1, "timeout", True
 
     wall_seconds = time.time() - started
-    result = next((e for e in reversed(events) if e.get("type") == "result"), {})
+    result = result_event(events)
     usage = result.get("usage", {}) or {}
     succeeded = returncode == 0 and not result.get("is_error") and not timed_out
     failure_reason = result.get("subtype") or ("timeout" if timed_out else f"exit-{returncode}")

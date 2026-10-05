@@ -8,6 +8,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import mlflow
+from dotenv import load_dotenv
+
 PROJECT_ROOT = Path(".")
 SKILLS_DIR = PROJECT_ROOT / "skills"
 DEFAULT_TRIALS_DIR = Path(
@@ -23,5 +26,18 @@ DEFAULT_ALLOWED_TOOLS = (
 )
 DEFAULT_MCP_CONFIG = PROJECT_ROOT / "mcp.json"
 
+# Each run's raw event stream, written by run-trial and read back by grade-trial.
+STREAM_FILE = "claude_stream.jsonl"
+
 SCRIPT_SUFFIXES = (".py",)
 PLOT_SUFFIXES = (".png", ".pdf", ".jpg", ".jpeg", ".svg")
+
+
+def connect_mlflow() -> str:
+    """Point MLflow at the tracking server named in ``.env``; return its URI."""
+    load_dotenv(PROJECT_ROOT / ".env")
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+    if not tracking_uri:
+        raise SystemExit("MLFLOW_TRACKING_URI is not set (expected in .env)")
+    mlflow.set_tracking_uri(tracking_uri)
+    return tracking_uri

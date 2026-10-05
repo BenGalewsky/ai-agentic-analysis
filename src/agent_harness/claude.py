@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 from pathlib import Path
 from typing import Any
+
+from .mcp_config import is_inline_json
+from .stream import parse_event
 
 
 def build_command(args: argparse.Namespace) -> list[str]:
@@ -28,7 +30,7 @@ def build_command(args: argparse.Namespace) -> list[str]:
     for config in args.mcp_config:
         # The agent runs in a staged workspace, so relative paths from the repo
         # root would not resolve; inline JSON strings are passed through as-is.
-        value = config if config.lstrip().startswith("{") else str(Path(config).resolve())
+        value = config if is_inline_json(config) else str(Path(config).resolve())
         cmd += ["--mcp-config", value]
     if args.strict_mcp_config:
         cmd.append("--strict-mcp-config")
@@ -66,15 +68,9 @@ def run_claude(
             for line in proc.stdout:
                 stream_file.write(line)
                 stream_file.flush()
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                events.append(event)
-                log_event(event)
+                if (event := parse_event(line)) is not None:
+                    events.append(event)
+                    log_event(event)
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
