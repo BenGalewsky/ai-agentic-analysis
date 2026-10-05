@@ -22,6 +22,9 @@ Regrade trials already on disk, taking expectations from the dataset:
 
     uv run scripts/grader.py ~/.cache/hep-agent-trials/20261005T071912Z-IRIS-HEP-v1
     uv run scripts/grader.py <trial_dir>/JetPtAll --tolerance 0.005
+
+A trial run with ``--repeats`` nests each repeat as ``<question>/r<k>/``; those are
+found under a trial or question directory and graded against ``<question>``.
 """
 
 from __future__ import annotations
@@ -237,15 +240,28 @@ def metrics_match(trace, expectations) -> Feedback:
 # --------------------------------------------------------------------------- #
 # Regrading trials on disk
 # --------------------------------------------------------------------------- #
+REPEAT_DIR = re.compile(r"r\d+")
+
+
 def question_dirs(paths: list[Path]) -> list[Path]:
-    """Accept question directories, or trial directories holding several."""
+    """Accept question or repeat directories, or trial directories holding several."""
     found = []
     for path in paths:
         if (path / "claude_stream.jsonl").exists():
             found.append(path)
         else:
-            found += sorted(p.parent for p in path.glob("*/claude_stream.jsonl"))
+            streams = [*path.glob("*/claude_stream.jsonl"), *path.glob("*/*/claude_stream.jsonl")]
+            found += sorted(p.parent for p in streams)
     return found
+
+
+def question_of(qdir: Path) -> str:
+    """The record name a directory holds a run of: its own, or its parent's for a repeat."""
+    return qdir.parent.name if REPEAT_DIR.fullmatch(qdir.name) else qdir.name
+
+
+def run_label(qdir: Path) -> str:
+    return f"{qdir.parent.name}-{qdir.name}" if REPEAT_DIR.fullmatch(qdir.name) else qdir.name
 
 
 def load_expectations(dataset_name: str) -> dict[str, dict[str, Any]]:
@@ -293,11 +309,12 @@ def main() -> int:
 
     grades = {}
     for qdir in dirs:
-        if qdir.name not in expectations:
-            print(f"SKIP {qdir.name:24} no record of that name in {args.dataset}", file=sys.stderr)
+        name = question_of(qdir)
+        if name not in expectations:
+            print(f"SKIP {run_label(qdir):24} no record of that name in {args.dataset}", file=sys.stderr)
             continue
-        grades[qdir.name] = grade(
-            expectations[qdir.name],
+        grades[run_label(qdir)] = grade(
+            expectations[name],
             metrics_from_stream(qdir / "claude_stream.jsonl"),
             args.tolerance,
             args.check_avg_entries,

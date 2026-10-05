@@ -14,6 +14,7 @@ A trial:
 Example:
     uv run scripts/run_trial.py
     uv run scripts/run_trial.py --question JetPtAll
+    uv run scripts/run_trial.py --question JetPtAll --repeats 5
     uv run scripts/run_trial.py --prompt IRIS-HEP --prompt-version 1 --model opus
 """
 
@@ -31,7 +32,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import fmean
+from statistics import fmean, stdev
 from typing import Any
 
 import mlflow
@@ -335,12 +336,23 @@ def final_text(events: list[dict[str, Any]]) -> str:
     return ""
 
 
-def log_trace(prompt_text: str, events: list[dict[str, Any]], result: dict[str, Any]) -> str:
-    """Record the trial as one MLflow trace with a child span per tool call; return its ID."""
+def log_trace(
+    prompt_text: str,
+    events: list[dict[str, Any]],
+    succeeded: bool,
+    metrics: dict[str, float],
+    tags: dict[str, str],
+) -> str:
+    """Record one repeat as an MLflow trace with a child span per tool call; return its ID.
+
+    A repeat that produced no events (a timeout, a failed launch) still gets an
+    error trace, so every repeat of a question is accounted for among its traces.
+    """
     root = mlflow.start_span_no_context(
         name="claude_code_trial",
         span_type=SpanType.AGENT,
         inputs={"prompt": prompt_text},
+        tags=tags,
     )
     try:
         for call in tool_blocks(events):
@@ -352,11 +364,10 @@ def log_trace(prompt_text: str, events: list[dict[str, Any]], result: dict[str, 
             )
             child.end(outputs={"result": call["output"]})
 
-        root.set_attribute("num_turns", result.get("num_turns"))
-        root.set_attribute("total_cost_usd", result.get("total_cost_usd"))
+        root.set_attributes(metrics)
         root.end(
             outputs={"result": final_text(events)},
-            status=SpanStatusCode.ERROR if result.get("is_error") else SpanStatusCode.OK,
+            status=SpanStatusCode.OK if succeeded else SpanStatusCode.ERROR,
         )
         return root.trace_id
     except Exception:
@@ -367,6 +378,13 @@ def log_trace(prompt_text: str, events: list[dict[str, Any]], result: dict[str, 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -392,6 +410,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="N",
         help="Run only the first N questions, by question_index (applied after --question)",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=positive_int,
+        default=1,
+        metavar="N",
+        help="Run each question N times, to measure how consistent the agent is (default: 1)",
     )
     parser.add_argument(
         "--var",
@@ -447,6 +472,214 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Question metrics summed over the repeats as `<key>_total`; a sum of the others
+# (rates, relative errors) means nothing.
+ADDITIVE_METRICS = (
+    "wall_seconds",
+    "duration_ms",
+    "api_duration_ms",
+    "num_turns",
+    "cost_usd",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "num_tool_calls",
+    "num_tool_errors",
+    "num_skill_calls",
+)
+
+
+def run_repeat(
+    args: argparse.Namespace,
+    prompt_text: str,
+    record: dict[str, Any],
+    repeat: int,
+    question_dir: Path,
+) -> dict[str, Any]:
+    """Run one repeat of a question inside its active question run.
+
+    Logs the repeat's artifacts (under ``r<k>/`` when there are several repeats)
+    and its trace, tagged and annotated with its own metrics, and returns its
+    summary; the question run's metrics are rolled up from these.
+    """
+    name = question_name(record)
+    repeated = args.repeats > 1
+    repeat_dir = question_dir / f"r{repeat}" if repeated else question_dir
+    prefix = f"r{repeat}/" if repeated else ""
+    workspace = stage_workspace(repeat_dir)
+    print(f"workspace: {workspace}")
+
+    stream_path = repeat_dir / "claude_stream.jsonl"
+    started = time.time()
+    try:
+        events, returncode, stderr = run_claude(
+            build_command(args), prompt_text, workspace, stream_path, args.timeout
+        )
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        events, returncode, stderr, timed_out = [], -1, "timeout", True
+
+    wall_seconds = time.time() - started
+    result = next((e for e in reversed(events) if e.get("type") == "result"), {})
+    usage = result.get("usage", {}) or {}
+    succeeded = returncode == 0 and not result.get("is_error") and not timed_out
+    failure_reason = result.get("subtype") or ("timeout" if timed_out else f"exit-{returncode}")
+    calls = tool_blocks(events)
+    skills_used = skill_calls(calls)
+
+    if stream_path.exists():
+        mlflow.log_artifact(str(stream_path), artifact_path=prefix.rstrip("/") or None)
+    if result:
+        mlflow.log_dict(result, f"{prefix}result.json")
+    if stderr:
+        mlflow.log_text(stderr, f"{prefix}stderr.txt")
+    mlflow.log_text(final_text(events), f"{prefix}final_output.md")
+
+    # The agent's own output: everything it wrote, minus the staged skills.
+    outputs = repeat_dir / "outputs"
+    shutil.copytree(workspace, outputs, ignore=shutil.ignore_patterns(".claude"))
+    if any(outputs.rglob("*")):
+        mlflow.log_artifacts(str(outputs), artifact_path=f"{prefix}outputs")
+
+    # Promote the two deliverables that matter to a predictable artifact path.
+    deliverables = find_deliverables(outputs)
+    for kind, path in deliverables.items():
+        mlflow.log_artifact(str(path), artifact_path=f"{prefix}final")
+        print(f"{kind:9}: {path.relative_to(outputs)}")
+
+    # Score the plots against the record's reference values.
+    graded = grade(record.get("expectations"), metrics_from_events(events))
+    plots_matched = sum(plot.passed for plot in graded.plots)
+    mlflow.log_dict(graded.to_dict(), f"{prefix}grade.json")
+
+    metrics = {
+        "wall_seconds": wall_seconds,
+        "duration_ms": result.get("duration_ms", 0) or 0,
+        "api_duration_ms": result.get("duration_api_ms", 0) or 0,
+        "num_turns": result.get("num_turns", 0) or 0,
+        "cost_usd": result.get("total_cost_usd", 0.0) or 0.0,
+        "input_tokens": usage.get("input_tokens", 0) or 0,
+        "output_tokens": usage.get("output_tokens", 0) or 0,
+        "cache_read_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+        "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
+        "num_tool_calls": len(calls),
+        "num_tool_errors": tool_errors(events),
+        "num_skill_calls": skills_used.total(),
+        "num_skill_file_reads": skill_file_reads(calls),
+        "completed": int(succeeded),
+        "produced_script": int("script" in deliverables),
+        "produced_plot": int("plot" in deliverables),
+        **graded.mlflow_metrics(),
+        "num_plots_expected": len(graded.plots),
+        "num_plots_matched": plots_matched,
+    }
+    tags = {
+        "question": name,
+        "repeat": str(repeat),
+        "status": "success" if succeeded else "failure",
+        "failure_reason": "" if succeeded else failure_reason,
+        "claude_session_id": result.get("session_id", ""),
+        "grade": "pass" if graded.passed else "fail",
+        "grade_message": graded.message,
+        **{
+            f"final_{kind}": deliverables[kind].name if kind in deliverables else ""
+            for kind in ("script", "plot")
+        },
+    }
+
+    trace_id = log_trace(prompt_text, events, succeeded, metrics, tags)
+    # Traces are exported in the background, and the server's auth layer
+    # answers 403 for a trace it has not stored yet - wait for the export.
+    mlflow.flush_trace_async_logging()
+    try:
+        mlflow.log_feedback(
+            trace_id=trace_id,
+            name="metrics_match",
+            value=graded.passed,
+            rationale=graded.message,
+            source=AssessmentSource(source_type=AssessmentSourceType.CODE, source_id="grader.py"),
+            metadata={"tolerance": str(graded.tolerance)},
+        )
+    except MlflowException as e:
+        # The grade is already on the run; don't lose the sweep over the trace copy.
+        print(f"warning  : could not attach grade to trace {trace_id}: {e.message}")
+
+    print(f"status   : {'success' if succeeded else 'FAILURE'}")
+    print(f"cost     : ${metrics['cost_usd']:.4f} over {metrics['num_turns']} turns")
+    print(f"grade    : {'PASS' if graded.passed else 'FAIL'} - {graded.message}")
+
+    return {
+        "name": name,
+        "repeat": repeat,
+        "trace_id": trace_id,
+        "succeeded": succeeded,
+        "correct": graded.passed,
+        "produced_script": "script" in deliverables,
+        "produced_plot": "plot" in deliverables,
+        "plots_expected": len(graded.plots),
+        "plots_matched": plots_matched,
+        "cost": metrics["cost_usd"],
+        "wall_seconds": wall_seconds,
+        "duration_ms": metrics["duration_ms"],
+        "api_duration_ms": metrics["api_duration_ms"],
+        "num_turns": metrics["num_turns"],
+        "num_tool_calls": len(calls),
+        "num_tool_errors": metrics["num_tool_errors"],
+        "input_tokens": metrics["input_tokens"],
+        "output_tokens": metrics["output_tokens"],
+        "cache_read_tokens": metrics["cache_read_tokens"],
+        "cache_creation_tokens": metrics["cache_creation_tokens"],
+        "skill_calls": skills_used,
+        "num_skill_file_reads": metrics["num_skill_file_reads"],
+        "metrics": metrics,
+        "tags": tags,
+    }
+
+
+def question_metrics(repeats: list[dict[str, Any]], skill_names: list[str]) -> dict[str, float]:
+    """Roll a question's repeats up into its run's metrics.
+
+    Each key holds the mean over the repeats - so a 0/1 outcome like
+    ``metrics_match`` becomes the share of repeats that passed - and, with more
+    than one repeat, ``<key>_std`` beside it and ``<key>_total`` for the additive
+    keys. A single repeat logs exactly its own values. A key a repeat did not log,
+    such as a plot's relative error when no METRIC line matched it, is averaged
+    over the repeats that did.
+    """
+    # Every repeat counts every skill any repeat used, so a skill's mean is over all of them.
+    skills = sorted({*skill_names, *(skill for r in repeats for skill in r["skill_calls"])})
+    for summary in repeats:
+        for skill in skills:
+            summary["metrics"][f"skill_calls_{skill}"] = summary["skill_calls"][skill]
+
+    metrics: dict[str, float] = {}
+    for key in dict.fromkeys(key for r in repeats for key in r["metrics"]):
+        values = [r["metrics"][key] for r in repeats if key in r["metrics"]]
+        metrics[key] = fmean(values)
+        if len(repeats) > 1:
+            if len(values) > 1:
+                metrics[f"{key}_std"] = stdev(values)
+            if key in ADDITIVE_METRICS:
+                metrics[f"{key}_total"] = sum(values)
+    return metrics
+
+
+def question_tags(repeats: list[dict[str, Any]]) -> dict[str, str]:
+    """A question run's tags: its only repeat's, or a summary across several."""
+    if len(repeats) == 1:
+        return {k: v for k, v in repeats[0]["tags"].items() if k not in ("question", "repeat")}
+    num_passed = sum(r["correct"] for r in repeats)
+    return {
+        "status": "success" if all(r["succeeded"] for r in repeats) else "failure",
+        "failure_reason": ",".join(
+            sorted({r["tags"]["failure_reason"] for r in repeats if not r["succeeded"]})
+        ),
+        "grade": "pass" if num_passed == len(repeats) else "fail",
+        "grade_message": f"{num_passed}/{len(repeats)} repeats passed",
+    }
+
+
 def run_question(
     args: argparse.Namespace,
     prompt,
@@ -454,15 +687,17 @@ def run_question(
     variables: dict[str, str],
     trial_dir: Path,
     common_params: dict[str, Any],
+    skill_names: list[str],
     tracking_uri: str,
-) -> dict[str, Any]:
-    """Run one question as a child run of the active trial run and return its summary."""
+) -> list[dict[str, Any]]:
+    """Run a question's repeats as one child run of the active trial run.
+
+    Each repeat is a trace on the run; returns the repeats' summaries.
+    """
     name = question_name(record)
     tags = record["tags"] or {}
     prompt_text = render_prompt(prompt, {**record["inputs"], **variables})
     question_dir = trial_dir / name
-    workspace = stage_workspace(question_dir)
-    print(f"workspace: {workspace}")
 
     with mlflow.start_run(run_name=name, nested=True, tags={"run_type": "question"}) as run:
         mlflow.log_params(
@@ -479,150 +714,20 @@ def run_question(
         if record.get("expectations"):
             mlflow.log_dict(record["expectations"], "expectations.json")
 
-        stream_path = question_dir / "claude_stream.jsonl"
-        started = time.time()
-        try:
-            events, returncode, stderr = run_claude(
-                build_command(args), prompt_text, workspace, stream_path, args.timeout
-            )
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            events, returncode, stderr, timed_out = [], -1, "timeout", True
+        repeats = []
+        for repeat in range(1, args.repeats + 1):
+            if args.repeats > 1:
+                print(f"-- repeat {repeat}/{args.repeats}")
+            repeats.append(run_repeat(args, prompt_text, record, repeat, question_dir))
 
-        wall_seconds = time.time() - started
-        result = next((e for e in reversed(events) if e.get("type") == "result"), {})
-        usage = result.get("usage", {}) or {}
-        succeeded = returncode == 0 and not result.get("is_error") and not timed_out
-        calls = tool_blocks(events)
-        skills_used = skill_calls(calls)
-
-        mlflow.log_metrics(
-            {
-                "wall_seconds": wall_seconds,
-                "duration_ms": result.get("duration_ms", 0),
-                "api_duration_ms": result.get("duration_api_ms", 0),
-                "num_turns": result.get("num_turns", 0),
-                "cost_usd": result.get("total_cost_usd", 0.0),
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-                "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
-                "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0),
-                "num_tool_calls": len(calls),
-                "num_tool_errors": tool_errors(events),
-                "num_skill_calls": skills_used.total(),
-                "num_skill_file_reads": skill_file_reads(calls),
-                **{
-                    f"skill_calls_{skill}": skills_used[skill]
-                    for skill in sorted({*common_params["skills"].split(","), *skills_used} - {""})
-                },
-                "completed": int(succeeded),
-            }
-        )
-        failure_reason = result.get("subtype") or ("timeout" if timed_out else f"exit-{returncode}")
-        mlflow.set_tags(
-            {
-                "status": "success" if succeeded else "failure",
-                "failure_reason": "" if succeeded else failure_reason,
-                "claude_session_id": result.get("session_id", ""),
-            }
-        )
-
-        if stream_path.exists():
-            mlflow.log_artifact(str(stream_path))
-        if result:
-            mlflow.log_dict(result, "result.json")
-        if stderr:
-            mlflow.log_text(stderr, "stderr.txt")
-        mlflow.log_text(final_text(events), "final_output.md")
-
-        # The agent's own output: everything it wrote, minus the staged skills.
-        outputs = question_dir / "outputs"
-        shutil.copytree(workspace, outputs, ignore=shutil.ignore_patterns(".claude"))
-        if any(outputs.rglob("*")):
-            mlflow.log_artifacts(str(outputs), artifact_path="outputs")
-
-        # Promote the two deliverables that matter to a predictable artifact path.
-        deliverables = find_deliverables(outputs)
-        for kind, path in deliverables.items():
-            mlflow.log_artifact(str(path), artifact_path="final")
-            print(f"{kind:9}: {path.relative_to(outputs)}")
-        mlflow.set_tags(
-            {
-                f"final_{kind}": deliverables[kind].name if kind in deliverables else ""
-                for kind in ("script", "plot")
-            }
-        )
-        mlflow.log_metrics(
-            {
-                "produced_script": int("script" in deliverables),
-                "produced_plot": int("plot" in deliverables),
-            }
-        )
-
-        # Score the plots against the record's reference values.
-        graded = grade(record.get("expectations"), metrics_from_events(events))
-        plots_matched = sum(plot.passed for plot in graded.plots)
-        mlflow.log_metrics(
-            {
-                **graded.mlflow_metrics(),
-                "num_plots_expected": len(graded.plots),
-                "num_plots_matched": plots_matched,
-            }
-        )
-        mlflow.set_tags({"grade": "pass" if graded.passed else "fail", "grade_message": graded.message})
-        mlflow.log_dict(graded.to_dict(), "grade.json")
-
-        trace_id = None
-        if events:
-            trace_id = log_trace(prompt_text, events, result)
-            # Traces are exported in the background, and the server's auth layer
-            # answers 403 for a trace it has not stored yet - wait for the export.
-            mlflow.flush_trace_async_logging()
-            try:
-                mlflow.log_feedback(
-                    trace_id=trace_id,
-                    name="metrics_match",
-                    value=graded.passed,
-                    rationale=graded.message,
-                    source=AssessmentSource(
-                        source_type=AssessmentSourceType.CODE, source_id="grader.py"
-                    ),
-                    metadata={"tolerance": str(graded.tolerance)},
-                )
-            except MlflowException as e:
-                # The grade is already on the run; don't lose the sweep over the trace copy.
-                print(f"warning  : could not attach grade to trace {trace_id}: {e.message}")
-
-        cost = result.get("total_cost_usd", 0) or 0
-        print(f"run      : {run.info.run_id}  ({'success' if succeeded else 'FAILURE'})")
-        print(f"cost     : ${cost:.4f} over {result.get('num_turns', 0)} turns")
-        print(f"grade    : {'PASS' if graded.passed else 'FAIL'} - {graded.message}")
+        mlflow.log_metrics(question_metrics(repeats, skill_names))
+        mlflow.set_tags(question_tags(repeats))
+        print(f"run      : {run.info.run_id}")
         print(f"ui       : {run_url(tracking_uri, run)}")
 
-    return {
-        "name": name,
-        "run_id": run.info.run_id,
-        "trace_id": trace_id,
-        "succeeded": succeeded,
-        "correct": graded.passed,
-        "produced_script": "script" in deliverables,
-        "produced_plot": "plot" in deliverables,
-        "plots_expected": len(graded.plots),
-        "plots_matched": plots_matched,
-        "cost": cost,
-        "wall_seconds": wall_seconds,
-        "duration_ms": result.get("duration_ms", 0) or 0,
-        "api_duration_ms": result.get("duration_api_ms", 0) or 0,
-        "num_turns": result.get("num_turns", 0) or 0,
-        "num_tool_calls": len(calls),
-        "num_tool_errors": tool_errors(events),
-        "input_tokens": usage.get("input_tokens", 0) or 0,
-        "output_tokens": usage.get("output_tokens", 0) or 0,
-        "cache_read_tokens": usage.get("cache_read_input_tokens", 0) or 0,
-        "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
-        "skill_calls": skills_used,
-        "num_skill_file_reads": skill_file_reads(calls),
-    }
+    for summary in repeats:
+        summary["run_id"] = run.info.run_id
+    return repeats
 
 
 def link_traces(trace_ids: list[str], run_id: str) -> None:
@@ -658,6 +763,10 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
     plots_expected = total("plots_expected")
     tool_calls = total("num_tool_calls")
     skills_used = sum((s["skill_calls"] for s in summaries), Counter())
+    # Each question's grades over its repeats, for consistency across repeats.
+    grades_by_question: dict[str, list[bool]] = {}
+    for s in summaries:
+        grades_by_question.setdefault(s["name"], []).append(s["correct"])
 
     metrics = {
         # Outcomes
@@ -665,6 +774,8 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
         "completion_rate": mean("succeeded"),
         "total_correct": num_correct,
         "accuracy": mean("correct"),
+        "pass_at_k": fmean(any(grades) for grades in grades_by_question.values()),
+        "pass_all_k": fmean(all(grades) for grades in grades_by_question.values()),
         "total_produced_script": total("produced_script"),
         "script_rate": mean("produced_script"),
         "total_produced_plot": total("produced_plot"),
@@ -712,8 +823,8 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
 
 
 def summary_table(summaries: list[dict[str, Any]]) -> dict[str, list[Any]]:
-    """One row per question, for side-by-side comparison of trials in the UI."""
-    columns = [key for key in summaries[0] if key != "skill_calls"]
+    """One row per repeat of each question, for side-by-side comparison of trials in the UI."""
+    columns = [key for key in summaries[0] if key not in ("skill_calls", "metrics", "tags")]
     table = {key: [s[key] for s in summaries] for key in columns}
     table["skills_invoked"] = [
         ",".join(f"{skill}:{count}" for skill, count in sorted(s["skill_calls"].items()))
@@ -764,6 +875,8 @@ def main() -> int:
 
     print(f"prompt   : {prompt.name} v{prompt.version}")
     print(f"dataset  : {args.dataset} ({len(records)} question{'s' if len(records) != 1 else ''})")
+    if args.repeats > 1:
+        print(f"repeats  : {args.repeats} per question ({len(records) * args.repeats} in all)")
     print(f"skills   : {', '.join(skill_names)} ({skills_hash})")
     if args.mcp_config:
         print(f"mcp      : {', '.join(mcp_server_names(args.mcp_config))}")
@@ -785,6 +898,7 @@ def main() -> int:
         "skills_hash": skills_hash,
         "skills": ",".join(skill_names),
         "num_skills": len(skill_names),
+        "num_repeats": args.repeats,
     }
 
     run_name = args.run_name or f"{prompt.name}-v{prompt.version}-{stamp}"
@@ -805,10 +919,8 @@ def main() -> int:
         summaries = []
         for i, record in enumerate(records, 1):
             print(f"\n[{i}/{len(records)}] {question_name(record)}")
-            summaries.append(
-                run_question(
-                    args, prompt, record, variables, trial_dir, common_params, tracking_uri
-                )
+            summaries += run_question(
+                args, prompt, record, variables, trial_dir, common_params, skill_names, tracking_uri
             )
 
         link_traces([s["trace_id"] for s in summaries if s["trace_id"]], run.info.run_id)
@@ -824,6 +936,11 @@ def main() -> int:
             f"\ntrial    : {run.info.run_id}  ({num_completed}/{len(summaries)} completed, "
             f"{num_correct}/{len(summaries)} correct)"
         )
+        if args.repeats > 1:
+            print(
+                f"repeats  : pass@{args.repeats} {metrics['pass_at_k']:.0%}, "
+                f"all {args.repeats} passed {metrics['pass_all_k']:.0%} of questions"
+            )
         print(
             f"skills   : {metrics['total_skill_calls']} call(s), used in "
             f"{metrics['skill_usage_rate']:.0%} of questions"
@@ -832,7 +949,8 @@ def main() -> int:
             status = "ok  " if s["succeeded"] else "FAIL"
             verdict = "pass" if s["correct"] else "fail"
             skills = ",".join(sorted(s["skill_calls"])) or "-"
-            print(f"  {status} {verdict} {s['name']:24} ${s['cost']:.4f}  {skills}")
+            name = f"{s['name']}-r{s['repeat']}" if args.repeats > 1 else s["name"]
+            print(f"  {status} {verdict} {name:24} ${s['cost']:.4f}  {skills}")
         print(f"cost     : ${total_cost:.4f}")
         print(f"ui       : {run_url(tracking_uri, run)}")
 

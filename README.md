@@ -25,7 +25,9 @@ every run, trials stay comparable as both evolve.
    streaming JSON events to the console and to `claude_stream.jsonl`.
 4. Logs each question as a child run — params, metrics, artifacts and an MLflow
    trace (one child span per tool call) — under a parent run for the whole
-   trial, which carries the aggregate completion rate and cost.
+   trial, which carries the aggregate completion rate and cost. With
+   `--repeats N` the question is run N times, each repeat a trace on the same
+   question run, whose metrics are the mean and standard deviation over them.
 
 Deliverables — the most recently modified `.py` and the most recently modified
 image — are promoted to the `final/` artifact path, so a plot is always in the
@@ -109,6 +111,12 @@ uv run scripts/run_trial.py --question JetPtAll --question 2 --experiment hep-pl
 uv run scripts/run_trial.py --limit 2 --experiment hep-plot-agent-dev
 ```
 
+Run each question several times, to see how consistently the agent gets it right:
+
+```bash
+uv run scripts/run_trial.py --question JetPtAll --repeats 5
+```
+
 ```bash
 uv run scripts/run_trial.py --prompt IRIS-HEP --prompt-version 1 --model opus
 ```
@@ -121,6 +129,7 @@ Useful options:
 | `--dataset` | Evaluation dataset of questions (default: `hep-data-llm-questions`) |
 | `--question` | Run only this question, by its `name` tag or `question_index` (repeatable) |
 | `--limit` | Run only the first N questions, by `question_index` |
+| `--repeats` | Run each question N times (default: 1) |
 | `--var KEY=VALUE` | Fill a prompt template variable (repeatable, overrides the dataset's inputs) |
 | `--experiment` | MLflow experiment name (default: `hep-plot-agent`) |
 | `--run-name` | Name of the parent trial run (default: `<prompt>-v<version>-<timestamp>`) |
@@ -165,6 +174,9 @@ for example with a tighter tolerance:
 uv run scripts/grader.py ~/.cache/hep-agent-trials/<trial-dir> --tolerance 0.005
 ```
 
+With `--repeats`, each repeat is staged in `<trial-dir>/<question>/r<k>/`, and
+the grader grades every repeat it finds against `<question>`'s record.
+
 `grader.metrics_match` is also an MLflow scorer that reads the METRIC lines from a
 logged trace's tool spans, so `mlflow.genai.evaluate` can rescore stored traces.
 
@@ -180,8 +192,8 @@ tags.run_type = 'trial'
 
 **Params** — prompt name/version/URI, dataset name and ID, model, permission
 mode, allowed tools, the MCP config path and the server names it declares, the
-skill list and its content hash. Question runs add the question name, index and
-dataset record ID.
+skill list and its content hash, and `num_repeats`. Question runs add the
+question name, index and dataset record ID.
 
 **Metrics** — per question: `wall_seconds`, `duration_ms`, `api_duration_ms`,
 `num_turns`, `cost_usd`, input/output/cache tokens, tool-call count, `num_tool_errors` (tool results
@@ -192,33 +204,51 @@ a staged skill's files). The grade adds `metrics_match`, `num_metric_lines`,
 `num_plots_expected`, `num_plots_matched` and each plot's `plot_<i>_mean_rel_err`
 and `plot_<i>_avg_entries_rel_err`.
 
+With `--repeats` above 1, each of these is the mean over the question's repeats —
+so `metrics_match` is the share of repeats that passed and `completed` the share
+that completed — with `<key>_std` (sample standard deviation) beside it, and
+`<key>_total` for the additive ones: cost, tokens, durations, turns, tool calls,
+tool errors and skill calls. A plot's relative errors are averaged over the
+repeats that printed a line for it. With one repeat, the run logs that repeat's
+values and nothing else, as it always has.
+
 The parent run rolls these up so two trials — say, before and after a skills
 change — compare at a glance:
 
 | Group | Metrics |
 | --- | --- |
-| Outcomes | `accuracy`, `completion_rate`, `script_rate`, `plot_rate`, `plot_accuracy` (reference plots matched, giving partial credit on multi-plot questions), plus the counts behind them: `total_completed`, `total_correct`, `total_produced_script`, `total_produced_plot`, `total_plots_expected`, `total_plots_matched` |
+| Outcomes | `accuracy`, `pass_at_k` (share of questions passed by at least one repeat), `pass_all_k` (share passed by every repeat), `completion_rate`, `script_rate`, `plot_rate`, `plot_accuracy` (reference plots matched, giving partial credit on multi-plot questions), plus the counts behind them: `total_completed`, `total_correct`, `total_produced_script`, `total_produced_plot`, `total_plots_expected`, `total_plots_matched` |
 | Cost and effort | `cost_per_correct_usd`, `tool_error_rate`, and `total_` and `mean_` of `cost_usd`, `wall_seconds`, `duration_ms`, `api_duration_ms`, `turns`, `tool_calls` and `tool_errors`; `total_` input/output/cache tokens |
 | Skill usage | `skill_usage_rate` (share of questions that invoked any skill), `total_skill_calls`, `mean_skill_calls`, `num_distinct_skills_used`, `total_skill_file_reads`, `total_skill_calls_<skill>` |
 
-Rates and means compare across trials with different numbers of questions. A
-rollup never reuses a question run's metric name, so each chart in the MLflow UI
-holds one kind of value whether it shows trial runs, question runs or both.
-`plot_accuracy`, `cost_per_correct_usd` and `tool_error_rate` are left out when
-their denominator is zero. The parent run also logs `questions.json`, a table
-with one row per question, for side-by-side comparison in the MLflow UI.
+Rates and means are taken over every repeat of every question, and `pass_at_k`
+and `pass_all_k` equal `accuracy` when each question runs once. Rates and means
+compare across trials with different numbers of questions. A rollup never reuses
+a question run's metric name, so each chart in the MLflow UI holds one kind of
+value whether it shows trial runs, question runs or both. `plot_accuracy`,
+`cost_per_correct_usd` and `tool_error_rate` are left out when their denominator
+is zero. The parent run also logs `questions.json`, a table with one row per
+repeat of each question, for side-by-side comparison in the MLflow UI.
 
 **Artifacts** — the parent run holds the prompt template, the MCP config and a
 snapshot of `skills/`. Each question run holds the rendered prompt, the record's
 `inputs.json` and `expectations.json`, the raw event stream, `result.json`,
 stderr, the agent's final message, everything it wrote under `outputs/`, the
 promoted `final/` deliverables, and `grade.json` with the per-plot comparison.
+With `--repeats` above 1, everything after `expectations.json` is per repeat and
+sits under `r<k>/`, e.g. `r2/final/`.
 
-**Trace** — the trial as a single agent span with a tool span per call, so a run
+**Trace** — each repeat as a single agent span with a tool span per call, so it
 can be replayed in the MLflow UI. The grade is attached to it as a
-`metrics_match` feedback assessment. Each trace belongs to its question run and
-is also linked to the parent run, so the parent's traces cover the whole trial and
-two trials can be compared trace by trace.
+`metrics_match` feedback assessment, the repeat's metrics are attributes of the
+agent span, and its tags carry `repeat`, `status`, `failure_reason`,
+`claude_session_id`, `grade` and the final script and plot names — on a question
+run with several repeats, these per-repeat details live only on the traces, and
+the run's `grade` is `pass` only when every repeat passed. A repeat that
+produced no output, such as a crash, still gets a trace, marked as an error.
+Each trace belongs to its question run and is also linked to the parent run, so
+the parent's traces cover the whole trial and two trials can be compared trace
+by trace.
 
 ## Skills
 
