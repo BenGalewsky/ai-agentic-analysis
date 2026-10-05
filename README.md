@@ -101,6 +101,14 @@ Run a single question, by name or `question_index`:
 uv run scripts/run_trial.py --question JetPtAll
 ```
 
+Run a few questions while developing, in a separate experiment so the benchmark
+results stay clean:
+
+```bash
+uv run scripts/run_trial.py --question JetPtAll --question 2 --experiment hep-plot-agent-dev
+uv run scripts/run_trial.py --limit 2 --experiment hep-plot-agent-dev
+```
+
 ```bash
 uv run scripts/run_trial.py --prompt IRIS-HEP --prompt-version 1 --model opus
 ```
@@ -111,7 +119,8 @@ Useful options:
 | --- | --- |
 | `--prompt` / `--prompt-version` | Which registered prompt to run (default: latest `IRIS-HEP`) |
 | `--dataset` | Evaluation dataset of questions (default: `hep-data-llm-questions`) |
-| `--question` | Run only this question, by its `name` tag or `question_index` |
+| `--question` | Run only this question, by its `name` tag or `question_index` (repeatable) |
+| `--limit` | Run only the first N questions, by `question_index` |
 | `--var KEY=VALUE` | Fill a prompt template variable (repeatable, overrides the dataset's inputs) |
 | `--experiment` | MLflow experiment name (default: `hep-plot-agent`) |
 | `--model` | Model alias passed to `claude`, e.g. `opus` |
@@ -126,6 +135,38 @@ Useful options:
 
 The script exits non-zero when any question fails, so it composes into a sweep.
 
+## Grading
+
+Each record's `expectations` hold reference values for every plot the question
+asks for:
+
+```json
+{"plots": [{"avg_entries_per_event": 1.0, "mean": 16.451025}], "n_plots": 1}
+```
+
+The prompt has the agent's script print one line per plot describing the values it
+filled the histogram with, in hep-data-llm's format:
+
+```
+METRIC: avg_entries_per_event=<N> mean=<M>
+```
+
+`scripts/grader.py` reads those lines from the last tool call that printed any (the
+agent's final run of its script) and passes the question when there are exactly
+`n_plots` of them and each reference plot is matched, one-to-one and in any order,
+by a line whose `mean` is within 1%. As in hep-data-llm, `avg_entries_per_event` is
+reported but not gated, since there are several valid ways to count entries.
+
+The harness grades every question as it runs. To regrade trials already on disk,
+for example with a tighter tolerance:
+
+```bash
+uv run scripts/grader.py ~/.cache/hep-agent-trials/<trial-dir> --tolerance 0.005
+```
+
+`grader.metrics_match` is also an MLflow scorer that reads the METRIC lines from a
+logged trace's tool spans, so `mlflow.genai.evaluate` can rescore stored traces.
+
 ## What gets recorded
 
 **Params** — prompt name/version/URI, dataset name and ID, model, permission
@@ -135,17 +176,20 @@ dataset record ID.
 
 **Metrics** — per question: wall time, API duration, turns, cost in USD,
 input/output/cache tokens, tool-call count, `completed`, and whether a script and
-a plot were produced. The parent run totals these as `num_completed`,
-`completion_rate`, `num_produced_plot`, `total_cost_usd` and `wall_seconds`.
+a plot were produced. The grade adds `metrics_match`, `num_metric_lines` and each
+plot's `plot_<i>_mean_rel_err` and `plot_<i>_avg_entries_rel_err`. The parent run
+totals these as `num_completed`, `completion_rate`, `num_produced_plot`,
+`num_correct`, `accuracy`, `total_cost_usd` and `wall_seconds`.
 
 **Artifacts** — the parent run holds the prompt template, the MCP config and a
 snapshot of `skills/`. Each question run holds the rendered prompt, the record's
 `inputs.json` and `expectations.json`, the raw event stream, `result.json`,
-stderr, the agent's final message, everything it wrote under `outputs/`, and the
-promoted `final/` deliverables.
+stderr, the agent's final message, everything it wrote under `outputs/`, the
+promoted `final/` deliverables, and `grade.json` with the per-plot comparison.
 
 **Trace** — the trial as a single agent span with a tool span per call, so a run
-can be replayed in the MLflow UI.
+can be replayed in the MLflow UI. The grade is attached to it as a
+`metrics_match` feedback assessment.
 
 ## Skills
 
@@ -170,6 +214,7 @@ before and after a skill change.
 scripts/
   run_trial.py           # the harness
   register_questions.py  # loads the benchmark questions into the MLflow dataset
+  grader.py              # scores a trial's METRIC lines against the expectations
 skills/         # domain skills staged into every trial workspace
 trials/         # local trial output (gitignored)
 ```

@@ -34,7 +34,14 @@ from typing import Any
 
 import mlflow
 from dotenv import load_dotenv
-from mlflow.entities import SpanStatusCode, SpanType
+from grader import grade, metrics_from_events
+from mlflow.entities import (
+    AssessmentSource,
+    AssessmentSourceType,
+    SpanStatusCode,
+    SpanType,
+)
+from mlflow.exceptions import MlflowException
 from mlflow.genai.datasets import get_dataset
 
 PROJECT_ROOT = Path(".")
@@ -301,8 +308,8 @@ def final_text(events: list[dict[str, Any]]) -> str:
     return ""
 
 
-def log_trace(prompt_text: str, events: list[dict[str, Any]], result: dict[str, Any]) -> None:
-    """Record the trial as one MLflow trace with a child span per tool call."""
+def log_trace(prompt_text: str, events: list[dict[str, Any]], result: dict[str, Any]) -> str:
+    """Record the trial as one MLflow trace with a child span per tool call; return its ID."""
     root = mlflow.start_span_no_context(
         name="claude_code_trial",
         span_type=SpanType.AGENT,
@@ -324,6 +331,7 @@ def log_trace(prompt_text: str, events: list[dict[str, Any]], result: dict[str, 
             outputs={"result": final_text(events)},
             status=SpanStatusCode.ERROR if result.get("is_error") else SpanStatusCode.OK,
         )
+        return root.trace_id
     except Exception:
         root.end(status=SpanStatusCode.ERROR)
         raise
@@ -345,10 +353,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--question",
-        default=None,
+        action="append",
+        default=[],
         metavar="NAME_OR_INDEX",
         help="Run only this question, by its name tag (e.g. JetPtAll) or question_index "
-        "(default: every question in the dataset)",
+        "(repeatable; default: every question in the dataset)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Run only the first N questions, by question_index (applied after --question)",
     )
     parser.add_argument(
         "--var",
@@ -502,12 +518,36 @@ def run_question(
             }
         )
 
+        # Score the plots against the record's reference values.
+        graded = grade(record.get("expectations"), metrics_from_events(events))
+        mlflow.log_metrics(graded.mlflow_metrics())
+        mlflow.set_tags({"grade": "pass" if graded.passed else "fail", "grade_message": graded.message})
+        mlflow.log_dict(graded.to_dict(), "grade.json")
+
         if events:
-            log_trace(prompt_text, events, result)
+            trace_id = log_trace(prompt_text, events, result)
+            # Traces are exported in the background, and the server's auth layer
+            # answers 403 for a trace it has not stored yet - wait for the export.
+            mlflow.flush_trace_async_logging()
+            try:
+                mlflow.log_feedback(
+                    trace_id=trace_id,
+                    name="metrics_match",
+                    value=graded.passed,
+                    rationale=graded.message,
+                    source=AssessmentSource(
+                        source_type=AssessmentSourceType.CODE, source_id="grader.py"
+                    ),
+                    metadata={"tolerance": str(graded.tolerance)},
+                )
+            except MlflowException as e:
+                # The grade is already on the run; don't lose the sweep over the trace copy.
+                print(f"warning  : could not attach grade to trace {trace_id}: {e.message}")
 
         cost = result.get("total_cost_usd", 0) or 0
         print(f"run      : {run.info.run_id}  ({'success' if succeeded else 'FAILURE'})")
         print(f"cost     : ${cost:.4f} over {result.get('num_turns', 0)} turns")
+        print(f"grade    : {'PASS' if graded.passed else 'FAIL'} - {graded.message}")
         print(f"ui       : {run_url(tracking_uri, run)}")
 
     return {
@@ -516,6 +556,7 @@ def run_question(
         "cost": cost,
         "wall_seconds": wall_seconds,
         "produced_plot": "plot" in deliverables,
+        "correct": graded.passed,
     }
 
 
@@ -546,8 +587,10 @@ def main() -> int:
     variables = dict(v.split("=", 1) for v in args.var)
     prompt = resolve_prompt(args.prompt, args.prompt_version)
     dataset, records = load_questions(args.dataset)
-    if args.question is not None:
-        records = [select_question(records, args.question)]
+    if args.question:
+        records = [select_question(records, key) for key in args.question]
+    if args.limit is not None:
+        records = records[: args.limit]
     # Fail on a template variable the dataset cannot fill before anything is launched.
     for record in records:
         render_prompt(prompt, {**record["inputs"], **variables})
@@ -587,7 +630,7 @@ def main() -> int:
         mlflow.log_params(
             {
                 **common_params,
-                "question_filter": args.question or "",
+                "question_filter": ",".join(args.question),
                 "num_questions": len(records),
             }
         )
@@ -606,12 +649,15 @@ def main() -> int:
             )
 
         num_completed = sum(s["succeeded"] for s in summaries)
+        num_correct = sum(s["correct"] for s in summaries)
         total_cost = sum(s["cost"] for s in summaries)
         mlflow.log_metrics(
             {
                 "num_completed": num_completed,
                 "completion_rate": num_completed / len(summaries),
                 "num_produced_plot": sum(s["produced_plot"] for s in summaries),
+                "num_correct": num_correct,
+                "accuracy": num_correct / len(summaries),
                 "total_cost_usd": total_cost,
                 "wall_seconds": sum(s["wall_seconds"] for s in summaries),
             }
@@ -619,9 +665,14 @@ def main() -> int:
         all_succeeded = num_completed == len(summaries)
         mlflow.set_tag("status", "success" if all_succeeded else "failure")
 
-        print(f"\ntrial    : {run.info.run_id}  ({num_completed}/{len(summaries)} completed)")
+        print(
+            f"\ntrial    : {run.info.run_id}  ({num_completed}/{len(summaries)} completed, "
+            f"{num_correct}/{len(summaries)} correct)"
+        )
         for s in summaries:
-            print(f"  {'ok  ' if s['succeeded'] else 'FAIL'} {s['name']:24} ${s['cost']:.4f}")
+            status = "ok  " if s["succeeded"] else "FAIL"
+            verdict = "pass" if s["correct"] else "fail"
+            print(f"  {status} {verdict} {s['name']:24} ${s['cost']:.4f}")
         print(f"cost     : ${total_cost:.4f}")
         print(f"ui       : {run_url(tracking_uri, run)}")
 
