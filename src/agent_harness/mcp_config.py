@@ -1,4 +1,4 @@
-"""Read and check the MCP server configs handed to Claude Code."""
+"""Read and check the MCP server configs handed to the agent (Claude Code's ``mcpServers`` format)."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def mcp_server_names(configs: list[str]) -> list[str]:
 def check_mcp_env(configs: list[str]) -> None:
     """Fail before launch on an unset ``${VAR}`` in a config.
 
-    Claude Code passes an unexpanded placeholder through verbatim, so a missing
+    The harness passes an unexpanded placeholder through verbatim, so a missing
     token surfaces only as an authentication failure once the trial is running.
     """
     missing = {

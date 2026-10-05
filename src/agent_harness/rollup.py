@@ -21,6 +21,7 @@ ADDITIVE_METRICS = (
     "num_tool_calls",
     "num_tool_errors",
     "num_skill_calls",
+    "num_mcp_calls",
 )
 
 
@@ -74,14 +75,21 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
     skills revision run over a subset of the questions; totals are kept for cost.
     A rollup never reuses a question run's metric key - it is prefixed `total_` or
     `mean_` - so a chart of a key holds one kind of value, whichever runs are shown.
+    A value a harness does not report (``None``, e.g. opencode's API duration) is
+    skipped, and its rollups left out when no repeat reported it.
     """
     n = len(summaries)
 
-    def total(key: str) -> float:
-        return sum(s[key] for s in summaries)
+    def reported(key: str) -> list[float]:
+        return [s[key] for s in summaries if s[key] is not None]
 
-    def mean(key: str) -> float:
-        return fmean(s[key] for s in summaries)
+    def total(key: str) -> float | None:
+        values = reported(key)
+        return sum(values) if values else None
+
+    def mean(key: str) -> float | None:
+        values = reported(key)
+        return fmean(values) if values else None
 
     num_correct = total("correct")
     plots_expected = total("plots_expected")
@@ -131,6 +139,10 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
         "skill_usage_rate": fmean(bool(s["skill_calls"]) for s in summaries),
         "num_distinct_skills_used": len(skills_used),
         "total_skill_file_reads": total("num_skill_file_reads"),
+        # MCP usage
+        "total_mcp_calls": total("num_mcp_calls"),
+        "mean_mcp_calls": mean("num_mcp_calls"),
+        "mcp_usage_rate": fmean(bool(s["num_mcp_calls"]) for s in summaries),
         **{
             f"total_skill_calls_{skill}": skills_used[skill]
             for skill in sorted({*skill_names, *skills_used})
@@ -143,7 +155,7 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
         metrics["cost_per_correct_usd"] = total("cost") / num_correct
     if tool_calls:
         metrics["tool_error_rate"] = total("num_tool_errors") / tool_calls
-    return metrics
+    return {key: value for key, value in metrics.items() if value is not None}
 
 
 def summary_table(summaries: list[dict[str, Any]]) -> dict[str, list[Any]]:

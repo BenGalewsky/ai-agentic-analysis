@@ -19,11 +19,12 @@ still reported, and ``--check-avg-entries`` gates on it too.
 
 Regrade trials already on disk, taking expectations from the dataset:
 
-    uv run grade-trial ~/.cache/hep-agent-trials/20261005T071912Z-IRIS-HEP-v1
+    uv run grade-trial ~/.cache/hep-agent-trials/20261005T071912Z-IRIS-HEP-v1-claude
     uv run grade-trial <trial_dir>/JetPtAll --tolerance 0.005
 
 A trial run with ``--repeats`` nests each repeat as ``<question>/r<k>/``; those are
 found under a trial or question directory and graded against ``<question>``.
+Either harness's event stream is read, so Claude Code and opencode trials regrade alike.
 """
 
 from __future__ import annotations
@@ -40,9 +41,9 @@ from typing import Any
 from mlflow.entities import Feedback, SpanType
 from mlflow.genai.scorers import scorer
 
-from .config import DEFAULT_DATASET, STREAM_FILE, connect_mlflow
+from .config import DEFAULT_DATASET, connect_mlflow
+from .harnesses import HARNESSES, Harness, ToolCall, read_events
 from .questions import load_questions, question_name
-from .stream import parse_event, tool_results
 
 DEFAULT_TOLERANCE = 0.01
 
@@ -87,14 +88,14 @@ def last_metrics(outputs: list[Any]) -> list[Metric]:
     return []
 
 
-def metrics_from_events(events: list[dict[str, Any]]) -> list[Metric]:
-    """METRIC lines from a Claude Code ``stream-json`` event list."""
-    return last_metrics([block.get("content") for block in tool_results(events)])
+def metrics_from_calls(calls: list[ToolCall]) -> list[Metric]:
+    """METRIC lines from a run's tool calls."""
+    return last_metrics([call.output for call in calls])
 
 
 def metrics_from_stream(path: Path) -> list[Metric]:
-    lines = path.read_text().splitlines()
-    return metrics_from_events([e for line in lines if (e := parse_event(line)) is not None])
+    """METRIC lines from an event stream, parsed by the harness that wrote it."""
+    return metrics_from_calls(harness_of(path)().tool_calls(read_events(path)))
 
 
 # --------------------------------------------------------------------------- #
@@ -228,17 +229,27 @@ def metrics_match(trace, expectations) -> Feedback:
 # Regrading trials on disk
 # --------------------------------------------------------------------------- #
 REPEAT_DIR = re.compile(r"r\d+")
+STREAM_FILES = {harness.stream_file: harness for harness in HARNESSES.values()}
+
+
+def harness_of(stream: Path) -> type[Harness]:
+    return STREAM_FILES[stream.name]
+
+
+def stream_in(qdir: Path) -> Path | None:
+    """The event stream a run directory holds, whichever harness wrote it."""
+    return next((qdir / name for name in STREAM_FILES if (qdir / name).exists()), None)
 
 
 def question_dirs(paths: list[Path]) -> list[Path]:
     """Accept question or repeat directories, or trial directories holding several."""
     found = []
     for path in paths:
-        if (path / STREAM_FILE).exists():
+        if stream_in(path):
             found.append(path)
         else:
-            streams = [*path.glob(f"*/{STREAM_FILE}"), *path.glob(f"*/*/{STREAM_FILE}")]
-            found += sorted(p.parent for p in streams)
+            streams = [p for name in STREAM_FILES for p in (*path.glob(f"*/{name}"), *path.glob(f"*/*/{name}"))]
+            found += sorted({p.parent for p in streams})
     return found
 
 
@@ -288,7 +299,7 @@ def main() -> int:
 
     dirs = question_dirs(args.paths)
     if not dirs:
-        raise SystemExit(f"No {STREAM_FILE} found under the given paths")
+        raise SystemExit(f"No {' or '.join(STREAM_FILES)} found under the given paths")
 
     grades = {}
     for qdir in dirs:
@@ -298,7 +309,7 @@ def main() -> int:
             continue
         grades[run_label(qdir)] = grade(
             expectations[name],
-            metrics_from_stream(qdir / STREAM_FILE),
+            metrics_from_stream(stream_in(qdir)),
             args.tolerance,
             args.check_avg_entries,
         )

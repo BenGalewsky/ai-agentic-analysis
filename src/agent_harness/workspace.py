@@ -18,11 +18,13 @@ def hash_skills(skills_dir: Path) -> str:
     return digest.hexdigest()[:12]
 
 
-def stage_workspace(root: Path) -> Path:
-    """Create an empty workspace with ``skills/`` copied in as project skills."""
+def stage_workspace(root: Path, skills_dir: str) -> Path:
+    """Create an empty workspace with ``skills/`` copied in as project skills, at
+    ``skills_dir`` (relative to the workspace) where the harness looks for them.
+    """
     workspace = root / "workspace"
     workspace.mkdir(parents=True)
-    shutil.copytree(SKILLS_DIR, workspace / ".claude" / "skills")
+    shutil.copytree(SKILLS_DIR, workspace / skills_dir)
     return workspace
 
 

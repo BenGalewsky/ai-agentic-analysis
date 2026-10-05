@@ -1,12 +1,13 @@
-"""Run Claude Code trials over an MLflow evaluation dataset of questions and report to MLflow.
+"""Run agent trials over an MLflow evaluation dataset of questions and report to MLflow.
 
 A trial:
   1. Pulls a prompt (default: ``IRIS-HEP``) from the MLflow Prompt Registry.
   2. Loads the questions from an MLflow evaluation dataset (default:
      ``hep-data-llm-questions``, written by ``register_questions.py``).
   3. For each question, renders the prompt with the record's inputs, stages a clean
-     workspace containing a snapshot of ``skills/`` and runs ``claude -p`` in it as a
-     subprocess, streaming JSON events.
+     workspace containing a snapshot of ``skills/`` and runs the agent harness in it
+     as a subprocess - Claude Code (``claude -p``, the default) or opencode
+     (``opencode run``) - streaming JSON events.
   4. Logs params, metrics, artifacts and an MLflow trace per question, each as a child
      run of one parent run for the whole trial.
 
@@ -15,6 +16,7 @@ Example:
     uv run run-trial --question JetPtAll
     uv run run-trial --question JetPtAll --repeats 5
     uv run run-trial --prompt IRIS-HEP --prompt-version 1 --model opus
+    uv run run-trial --harness opencode --model lumen/qwen3-coder-next
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ from pathlib import Path
 import mlflow
 
 from .config import (
-    DEFAULT_ALLOWED_TOOLS,
     DEFAULT_DATASET,
     DEFAULT_EXPERIMENT,
     DEFAULT_MCP_CONFIG,
@@ -33,6 +34,7 @@ from .config import (
     DEFAULT_TRIALS_DIR,
     connect_mlflow,
 )
+from .harnesses import HARNESSES
 from .mcp_config import check_mcp_env
 from .prompts import render_prompt, resolve_prompt
 from .questions import load_questions, select_question
@@ -90,20 +92,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-name",
         default=None,
-        help="Name of the parent trial run (default: <prompt>-v<version>-<timestamp>)",
+        help="Name of the parent trial run (default: <prompt>-v<version>-<harness>-<timestamp>)",
     )
-    parser.add_argument("--model", default=None, help="Model alias passed to claude, e.g. opus")
-    parser.add_argument("--claude-bin", default="claude")
+    parser.add_argument(
+        "--harness",
+        default="claude",
+        choices=sorted(HARNESSES),
+        help="Agent harness to run each question with (default: claude)",
+    )
+    parser.add_argument(
+        "--harness-bin",
+        default=None,
+        help="Path to the harness's CLI (default: claude or opencode on PATH)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model passed to the harness, e.g. opus for claude or lumen/qwen3-coder-next "
+        "(provider/model) for opencode",
+    )
     parser.add_argument(
         "--permission-mode",
-        default="bypassPermissions",
+        default=None,
         choices=["acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan"],
-        help="Claude Code permission mode for the trial (default lets the agent run unattended)",
+        help="Claude Code permission mode for the trial (default: bypassPermissions, so the "
+        "agent runs unattended; claude only)",
     )
     parser.add_argument(
         "--allowed-tools",
-        default=DEFAULT_ALLOWED_TOOLS,
-        help="Tools the agent may use without prompting (space-separated)",
+        default=None,
+        help="Tools the agent may use without prompting (space-separated; claude only)",
     )
     parser.add_argument(
         "--trials-dir",
@@ -126,10 +144,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict-mcp-config",
         action="store_true",
-        help="Ignore user/project MCP settings, so only --mcp-config servers are loaded",
+        help="Ignore user/project MCP settings, so only --mcp-config servers are loaded "
+        "(claude only)",
+    )
+    parser.add_argument(
+        "--global-skills",
+        action="store_true",
+        help="Also let the agent see your own and your plugins' skills (default: only the "
+        "staged skills/, plus Claude Code's built-in ones for claude)",
     )
     parser.add_argument("--timeout", type=int, default=3600, help="Subprocess timeout in seconds")
-    parser.add_argument("--max-budget-usd", type=float, default=None)
+    parser.add_argument(
+        "--max-budget-usd", type=float, default=None, help="Cap the spend on each question (claude only)"
+    )
     return parser.parse_args()
 
 
@@ -144,6 +171,8 @@ def main() -> int:
         args.mcp_config = [str(DEFAULT_MCP_CONFIG)] if DEFAULT_MCP_CONFIG.exists() else []
 
     check_mcp_env(args.mcp_config)
+    harness = HARNESSES[args.harness](args)
+    harness.check_args()
 
     variables = dict(v.split("=", 1) for v in args.var)
     prompt = resolve_prompt(args.prompt, args.prompt_version)
@@ -156,4 +185,4 @@ def main() -> int:
     for record in records:
         render_prompt(prompt, {**record["inputs"], **variables})
 
-    return 0 if run_trial(args, prompt, dataset, records, variables, tracking_uri) else 1
+    return 0 if run_trial(args, harness, prompt, dataset, records, variables, tracking_uri) else 1
