@@ -175,11 +175,27 @@ skill list and its content hash. Question runs add the question name, index and
 dataset record ID.
 
 **Metrics** — per question: wall time, API duration, turns, cost in USD,
-input/output/cache tokens, tool-call count, `completed`, and whether a script and
-a plot were produced. The grade adds `metrics_match`, `num_metric_lines` and each
-plot's `plot_<i>_mean_rel_err` and `plot_<i>_avg_entries_rel_err`. The parent run
-totals these as `num_completed`, `completion_rate`, `num_produced_plot`,
-`num_correct`, `accuracy`, `total_cost_usd` and `wall_seconds`.
+input/output/cache tokens, tool-call count, `num_tool_errors` (tool results
+flagged as errors), `completed`, and whether a script and a plot were produced.
+Skill usage is counted as `num_skill_calls` (invocations of the `Skill` tool),
+`skill_calls_<skill>` for each skill, and `num_skill_file_reads` (`Read` calls on
+a staged skill's files). The grade adds `metrics_match`, `num_metric_lines`,
+`num_plots_expected`, `num_plots_matched` and each plot's `plot_<i>_mean_rel_err`
+and `plot_<i>_avg_entries_rel_err`.
+
+The parent run rolls these up so two trials — say, before and after a skills
+change — compare at a glance:
+
+| Group | Metrics |
+| --- | --- |
+| Outcomes | `accuracy`, `completion_rate`, `script_rate`, `plot_rate`, `plot_accuracy` (reference plots matched, giving partial credit on multi-plot questions), plus the `num_*` counts behind them |
+| Cost and effort | `total_cost_usd`, `mean_cost_usd`, `cost_per_correct_usd`, `wall_seconds`, `mean_wall_seconds`, `mean_turns`, `mean_tool_calls`, `mean_tool_errors`, `tool_error_rate`, total input/output/cache tokens |
+| Skill usage | `skill_usage_rate` (share of questions that invoked any skill), `num_skill_calls`, `mean_skill_calls`, `num_distinct_skills_used`, `num_skill_file_reads`, `skill_calls_<skill>` |
+
+Rates and means compare across trials with different numbers of questions.
+`plot_accuracy`, `cost_per_correct_usd` and `tool_error_rate` are left out when
+their denominator is zero. The parent run also logs `questions.json`, a table
+with one row per question, for side-by-side comparison in the MLflow UI.
 
 **Artifacts** — the parent run holds the prompt template, the MCP config and a
 snapshot of `skills/`. Each question run holds the rendered prompt, the record's
