@@ -1,15 +1,18 @@
 # ai-agentic-analysis
 
 A test harness for measuring how well an agentic coding assistant can carry out a
-HEP physics analysis task. A trial gives Claude Code a physics prompt plus a
-curated set of domain skills, lets it work unattended in a clean workspace, and
-records everything — cost, turns, tool calls, and the script and plot it produced —
-to MLflow.
+HEP physics analysis task. A trial gives an agent harness — Claude Code or
+[opencode](https://opencode.ai) — a physics prompt plus a curated set of domain
+skills and MCP servers, lets it work unattended in a clean workspace, and records
+everything — cost, turns, tool calls, and the script and plot it produced — to
+MLflow.
 
 The question it exists to answer: *do the skills in `skills/` actually make the
 agent better at writing a ServiceX/Awkward/hist analysis?* Because prompts are
 versioned in the MLflow Prompt Registry and the skill tree is content-hashed into
-every run, trials stay comparable as both evolve.
+every run, trials stay comparable as both evolve. Because both harnesses get the
+same prompt, skills and MCP servers and are graded and recorded the same way, a
+trial per harness also answers *how much does the harness itself matter?*
 
 ## How a trial works
 
@@ -21,8 +24,14 @@ every run, trials stay comparable as both evolve.
    dataset, which `scripts/register_questions.py` populates.
 3. For each question, renders the prompt with the record's `inputs` (the
    `{{ question }}` variable), stages a clean workspace with `skills/` copied in
-   as `.claude/skills`, and runs `claude --print` there as a subprocess,
-   streaming JSON events to the console and to `claude_stream.jsonl`.
+   where the harness looks for project skills, and runs the harness there as a
+   subprocess, streaming JSON events to the console and to its stream file:
+
+   | `--harness` | Runs | Skills staged in | Stream file |
+   | --- | --- | --- | --- |
+   | `claude` (default) | `claude --print --output-format stream-json` | `.claude/skills` | `claude_stream.jsonl` |
+   | `opencode` | `opencode run --standalone --format json --auto` | `.opencode/skills` | `opencode_stream.jsonl` |
+
 4. Logs each question as a child run — params, metrics, artifacts and an MLflow
    trace (one child span per tool call) — under a parent run for the whole
    trial, which carries the aggregate completion rate and cost. With
@@ -35,8 +44,10 @@ same place across runs.
 
 ## Setup
 
-Requires Python 3.13+, [uv](https://docs.astral.sh/uv/), and the
-[Claude Code](https://claude.com/claude-code) CLI on `PATH`.
+Requires Python 3.13+, [uv](https://docs.astral.sh/uv/), and the CLI of each
+harness you run on `PATH`: [Claude Code](https://claude.com/claude-code) for
+`--harness claude`, [opencode](https://opencode.ai) v2 for `--harness opencode`
+(or point `--harness-bin` at either).
 
 ```bash
 uv sync
@@ -55,10 +66,33 @@ cp .env.example .env
 
 `.env` is gitignored — keep credentials out of the repo.
 
+### opencode
+
+opencode takes its providers and models from your own opencode config
+(`~/.config/opencode/opencode.json`), so set up the provider you want there first
+and name the model as `provider/model`:
+
+```bash
+uv run run-trial --harness opencode --model lumen/qwen3-coder-next
+```
+
+Each run uses `--standalone`, a private opencode server started in the workspace
+with the harness's environment, rather than the shared background service, which
+would use its own working directory, environment and config. `--auto` approves
+every permission request, the equivalent of Claude Code's `bypassPermissions`.
+The JSON stream leaves out the last step's token usage, so after each run the
+harness exports the session (`opencode session export`) to
+`opencode_session.json` and takes the cost, tokens, turns and outcome from it.
+The cost is opencode's, computed from the prices in your provider config.
+
+The sessions stay in opencode's own database, so they can be reopened, since
+opencode has no equivalent of `--no-session-persistence`.
+
 ## MCP servers
 
-`mcp.json` declares the MCP servers the agent gets in every trial, and
-the harness passes it to `claude` with `--mcp-config`. It currently holds the
+`mcp.json` declares the MCP servers the agent gets in every trial, in Claude
+Code's format. The harness passes it to `claude` with `--mcp-config`, and
+translates it for opencode (see below). It currently holds the
 UChicago Analysis Facility server, authenticated with a personal access token:
 
 ```json
@@ -82,7 +116,7 @@ route. Mint one at [mcp-portal.af.uchicago.edu/tokens/](https://mcp-portal.af.uc
 MCP_BEARER_TOKEN=<your-token>
 ```
 
-The harness loads `.env` and the subprocess inherits it, so `claude` expands
+The harness loads `.env` and the subprocess inherits it, so the agent expands
 `${MCP_BEARER_TOKEN}` at launch. An unset variable is not an error to the CLI —
 it forwards the placeholder verbatim and the server answers 401 — so the harness
 checks for it up front and refuses to start the trial.
@@ -92,6 +126,16 @@ The server's tools are named `mcp__af__<tool>`, and `mcp__af` in
 config (repeatable, also accepts inline JSON), `--no-mcp` to run without one, and
 `--strict-mcp-config` to ignore whatever MCP servers your user and project
 settings add, so a trial sees only what the config names.
+
+For opencode, each server becomes an entry under opencode's `mcp.servers`:
+`http` and `sse` servers become `remote` ones, with OAuth turned off since a trial
+cannot sign in, and `stdio` servers become `local` ones. `${VAR}` is rewritten as
+opencode's `{env:VAR}`, so the token is still read from the environment and never
+written down. A `${VAR:-default}` cannot be translated and stops the trial. The
+result is handed to opencode as `OPENCODE_CONFIG_CONTENT`, merged over your own
+config, and logged on the trial run as `opencode_config.json`. opencode names the
+server's tools `af_<tool>`, and its Code Mode calls them from scripts run by its
+`execute` tool. The harness counts MCP calls made either way.
 
 ## Running
 
@@ -125,6 +169,13 @@ uv run run-trial --question JetPtAll --repeats 5
 uv run run-trial --prompt IRIS-HEP --prompt-version 1 --model opus
 ```
 
+Compare the harnesses by running a trial with each, on the same questions:
+
+```bash
+uv run run-trial --question JetPtAll --repeats 5 --model opus
+uv run run-trial --question JetPtAll --repeats 5 --harness opencode --model lumen/qwen3-coder-next
+```
+
 Useful options:
 
 | Option | Purpose |
@@ -136,18 +187,26 @@ Useful options:
 | `--repeats` | Run each question N times (default: 1) |
 | `--var KEY=VALUE` | Fill a prompt template variable (repeatable, overrides the dataset's inputs) |
 | `--experiment` | MLflow experiment name (default: `hep-plot-agent`) |
-| `--run-name` | Name of the parent trial run (default: `<prompt>-v<version>-<timestamp>`) |
-| `--model` | Model alias passed to `claude`, e.g. `opus` |
-| `--allowed-tools` | Tools the agent may use without prompting |
+| `--run-name` | Name of the parent trial run (default: `<prompt>-v<version>-<harness>-<timestamp>`) |
+| `--harness` | Agent harness: `claude` (default) or `opencode` |
+| `--harness-bin` | Path to the harness's CLI (default: `claude` or `opencode` on `PATH`) |
+| `--model` | Model passed to the harness, e.g. `opus` for claude, `lumen/qwen3-coder-next` for opencode |
+| `--allowed-tools` | Tools the agent may use without prompting (claude only) |
 | `--mcp-config` | MCP config file or inline JSON (repeatable, default: `mcp.json`) |
 | `--no-mcp` | Run the trial with no MCP servers |
-| `--strict-mcp-config` | Load only the servers in `--mcp-config`, ignoring user/project settings |
-| `--permission-mode` | Defaults to `bypassPermissions` so the trial runs unattended |
+| `--strict-mcp-config` | Load only the servers in `--mcp-config`, ignoring user/project settings (claude only) |
+| `--permission-mode` | Defaults to `bypassPermissions` so the trial runs unattended (claude only) |
 | `--trials-dir` | Where workspaces are staged (default: `$TRIAL_WORKSPACE_ROOT` or `~/.cache/hep-agent-trials`) |
-| `--timeout` | Subprocess timeout in seconds (default: 3600) |
-| `--max-budget-usd` | Cap the spend on each question |
+| `--global-skills` | Also let the agent see your own and your plugins' skills (default: only the staged `skills/`) |
+| `--timeout` | Per-run timeout in seconds, after which the agent and everything it started are killed (default: 3600) |
+| `--max-budget-usd` | Cap the spend on each question (claude only) |
 
-The script exits non-zero when any question fails, so it composes into a sweep.
+Before anything runs, the harness checks that its CLI works (`--version`), and for
+opencode that it is v2 and the model is named `provider/model`. Passing a
+claude-only option with `--harness opencode` also stops the trial before it
+starts, rather than being silently ignored. Ctrl-C stops the agent along with the
+harness. The script exits non-zero when any
+question fails, so it composes into a sweep.
 
 ## Grading
 
@@ -179,7 +238,9 @@ uv run grade-trial ~/.cache/hep-agent-trials/<trial-dir> --tolerance 0.005
 ```
 
 With `--repeats`, each repeat is staged in `<trial-dir>/<question>/r<k>/`, and
-the grader grades every repeat it finds against `<question>`'s record.
+the grader grades every repeat it finds against `<question>`'s record. It reads
+whichever harness's stream file a run left, so Claude Code and opencode trials
+regrade alike.
 
 `agent_harness.grader.metrics_match` is also an MLflow scorer that reads the
 METRIC lines from a logged trace's tool spans, so `mlflow.genai.evaluate` can rescore stored traces.
@@ -187,24 +248,30 @@ METRIC lines from a logged trace's tool spans, so `mlflow.genai.evaluate` can re
 ## What gets recorded
 
 **Tags** — every run carries `run_type`: `trial` on the parent run, `question` on
-each question run. To see only the trials, for example to chart their rollups
-side by side, filter the runs with:
+each question run, and `harness`. To see only the trials, for example to chart
+their rollups side by side, filter the runs with:
 
 ```
 tags.run_type = 'trial'
 ```
 
-**Params** — prompt name/version/URI, dataset name and ID, model, permission
-mode, allowed tools, the MCP config path and the server names it declares, the
-skill list and its content hash, and `num_repeats`. Question runs add the
-question name, index and dataset record ID.
+and add `and tags.harness = 'opencode'` to narrow them to one harness.
+
+**Params** — the harness and its version, prompt name/version/URI, dataset name
+and ID, model, permission mode, the MCP config path and the server names it
+declares, the skill list and its content hash, and `num_repeats`; for claude also
+the allowed tools and `strict_mcp_config`. Question runs add the question name,
+index and dataset record ID.
 
 **Metrics** — per question: `wall_seconds`, `duration_ms`, `api_duration_ms`,
 `num_turns`, `cost_usd`, input/output/cache tokens, tool-call count, `num_tool_errors` (tool results
 flagged as errors), `completed`, and whether a script and a plot were produced.
-Skill usage is counted as `num_skill_calls` (invocations of the `Skill` tool),
-`skill_calls_<skill>` for each skill, and `num_skill_file_reads` (`Read` calls on
-a staged skill's files). The grade adds `metrics_match`, `num_metric_lines`,
+Skill usage is counted as `num_skill_calls` (invocations of the skill tool —
+Claude Code's `Skill`, opencode's `skill`), `skill_calls_<skill>` for each skill,
+and `num_skill_file_reads` (read calls on a staged skill's files); MCP usage as
+`num_mcp_calls`. opencode does not report API time, so its runs have no
+`api_duration_ms`, and a turn is one of its model steps; a shell command that
+exits non-zero counts as a tool error under both harnesses. The grade adds `metrics_match`, `num_metric_lines`,
 `num_plots_expected`, `num_plots_matched` and each plot's `plot_<i>_mean_rel_err`
 and `plot_<i>_avg_entries_rel_err`.
 
@@ -212,7 +279,7 @@ With `--repeats` above 1, each of these is the mean over the question's repeats 
 so `metrics_match` is the share of repeats that passed and `completed` the share
 that completed — with `<key>_std` (sample standard deviation) beside it, and
 `<key>_total` for the additive ones: cost, tokens, durations, turns, tool calls,
-tool errors and skill calls. A plot's relative errors are averaged over the
+tool errors, skill calls and MCP calls. A plot's relative errors are averaged over the
 repeats that printed a line for it. With one repeat, the run logs that repeat's
 values and nothing else, as it always has.
 
@@ -224,6 +291,7 @@ change — compare at a glance:
 | Outcomes | `accuracy`, `pass_at_k` (share of questions passed by at least one repeat), `pass_all_k` (share passed by every repeat), `completion_rate`, `script_rate`, `plot_rate`, `plot_accuracy` (reference plots matched, giving partial credit on multi-plot questions), plus the counts behind them: `total_completed`, `total_correct`, `total_produced_script`, `total_produced_plot`, `total_plots_expected`, `total_plots_matched` |
 | Cost and effort | `cost_per_correct_usd`, `tool_error_rate`, and `total_` and `mean_` of `cost_usd`, `wall_seconds`, `duration_ms`, `api_duration_ms`, `turns`, `tool_calls` and `tool_errors`; `total_` input/output/cache tokens |
 | Skill usage | `skill_usage_rate` (share of questions that invoked any skill), `total_skill_calls`, `mean_skill_calls`, `num_distinct_skills_used`, `total_skill_file_reads`, `total_skill_calls_<skill>` |
+| MCP usage | `mcp_usage_rate` (share of questions that called any MCP tool), `total_mcp_calls`, `mean_mcp_calls` |
 
 Rates and means are taken over every repeat of every question, and `pass_at_k`
 and `pass_all_k` equal `accuracy` when each question runs once. Rates and means
@@ -231,22 +299,28 @@ compare across trials with different numbers of questions. A rollup never reuses
 a question run's metric name, so each chart in the MLflow UI holds one kind of
 value whether it shows trial runs, question runs or both. `plot_accuracy`,
 `cost_per_correct_usd` and `tool_error_rate` are left out when their denominator
-is zero. The parent run also logs `questions.json`, a table with one row per
+is zero, and a rollup of a value the harness does not report, such as opencode's
+`api_duration_ms`, is left out rather than logged as 0. The parent run also logs `questions.json`, a table with one row per
 repeat of each question, for side-by-side comparison in the MLflow UI.
 
-**Artifacts** — the parent run holds the prompt template, the MCP config and a
-snapshot of `skills/`. Each question run holds the rendered prompt, the record's
-`inputs.json` and `expectations.json`, the raw event stream, `result.json`,
+**Artifacts** — the parent run holds the prompt template, the MCP config (and,
+for opencode, its translation `opencode_config.json`) and a snapshot of
+`skills/`. Each question run holds the rendered prompt, the record's
+`inputs.json` and `expectations.json`, the raw event stream (and, for opencode,
+`opencode_session.json`), `result.json` (Claude Code's result event, or the
+opencode session's summary),
 stderr, the agent's final message, everything it wrote under `outputs/`, the
 promoted `final/` deliverables, and `grade.json` with the per-plot comparison.
 With `--repeats` above 1, everything after `expectations.json` is per repeat and
 sits under `r<k>/`, e.g. `r2/final/`.
 
-**Trace** — each repeat as a single agent span with a tool span per call, so it
+**Trace** — each repeat as a single agent span (`claude_trial` or
+`opencode_trial`) with a tool span per call, marked as an error when the call
+failed, so it
 can be replayed in the MLflow UI. The grade is attached to it as a
 `metrics_match` feedback assessment, the repeat's metrics are attributes of the
 agent span, and its tags carry `repeat`, `status`, `failure_reason`,
-`claude_session_id`, `grade` and the final script and plot names — on a question
+`session_id`, `grade` and the final script and plot names — on a question
 run with several repeats, these per-repeat details live only on the traces, and
 the run's `grade` is `pass` only when every repeat passed. A repeat that
 produced no output, such as a crash, still gets a trace, marked as an error.
@@ -271,14 +345,28 @@ The skills staged into each workspace cover the HEP Python stack:
 Editing a skill changes `skills_hash`, which is the handle for comparing runs
 before and after a skill change.
 
+By default a trial's agent sees only these skills, not the ones in your own
+`~/.claude/skills`, `~/.agents/skills` or plugins, so results don't depend on whose
+machine ran them. opencode is given a skill permission list that denies every
+skill but the staged ones, which also hides its own built-in `opencode` and
+`report` skills. Claude Code runs with `--setting-sources project,local`, which
+skips your user settings and with them your skills and plugins. Its built-in
+skills (`dataviz`, `loop`, `code-review` and so on) cannot be removed without
+removing the staged ones too, so they remain. Skipping user settings also means
+claude's `model` and effort settings no longer apply: pass `--model` to choose
+one. `--global-skills` turns the isolation off, and is logged as the
+`global_skills` param.
+
 ## Layout
 
 ```
 src/agent_harness/       # the harness package
   cli.py                 # run-trial: options and setup
   trial.py               # runs the questions and their repeats under one trial run
-  claude.py              # the claude -p subprocess
-  stream.py              # reads tool calls and skill use out of the event stream
+  harnesses/             # the agents a trial can run, each read into one RunSummary
+    base.py              # the Harness interface and the subprocess loop
+    claude.py            # claude -p and its stream-json events
+    opencode.py          # opencode run, its JSON events and the MCP config translation
   tracing.py             # MLflow traces
   rollup.py              # question- and trial-level metrics
   prompts.py, questions.py, workspace.py, mcp_config.py, config.py

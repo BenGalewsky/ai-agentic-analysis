@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import mlflow
 from mlflow.entities import SpanStatusCode, SpanType
 from mlflow.exceptions import MlflowException
 
-from .stream import final_text, tool_blocks
+from .harnesses import RunSummary
 
 
 def log_trace(
+    harness: str,
     prompt_text: str,
-    events: list[dict[str, Any]],
+    summary: RunSummary,
     succeeded: bool,
     metrics: dict[str, float],
     tags: dict[str, str],
@@ -24,24 +23,27 @@ def log_trace(
     error trace, so every repeat of a question is accounted for among its traces.
     """
     root = mlflow.start_span_no_context(
-        name="claude_code_trial",
+        name=f"{harness}_trial",
         span_type=SpanType.AGENT,
         inputs={"prompt": prompt_text},
         tags=tags,
     )
     try:
-        for call in tool_blocks(events):
+        for call in summary.calls:
             child = mlflow.start_span_no_context(
-                name=call["name"] or "tool",
+                name=call.name or "tool",
                 span_type=SpanType.TOOL,
                 parent_span=root,
-                inputs=call["input"],
+                inputs=call.input,
             )
-            child.end(outputs={"result": call["output"]})
+            child.end(
+                outputs={"result": call.output},
+                status=SpanStatusCode.ERROR if call.is_error else SpanStatusCode.OK,
+            )
 
         root.set_attributes(metrics)
         root.end(
-            outputs={"result": final_text(events)},
+            outputs={"result": summary.final_text},
             status=SpanStatusCode.OK if succeeded else SpanStatusCode.ERROR,
         )
         return root.trace_id

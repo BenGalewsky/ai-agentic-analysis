@@ -21,13 +21,11 @@ DEFAULT_TRIALS_DIR = Path(
 DEFAULT_EXPERIMENT = "hep-plot-agent"
 DEFAULT_PROMPT = "IRIS-HEP"
 DEFAULT_DATASET = "hep-data-llm-questions"
+# Claude Code's --allowed-tools default.
 DEFAULT_ALLOWED_TOOLS = (
     "Bash Read Write Edit Glob Grep Skill WebFetch WebSearch TodoWrite mcp__af"
 )
 DEFAULT_MCP_CONFIG = PROJECT_ROOT / "mcp.json"
-
-# Each run's raw event stream, written by run-trial and read back by grade-trial.
-STREAM_FILE = "claude_stream.jsonl"
 
 SCRIPT_SUFFIXES = (".py",)
 PLOT_SUFFIXES = (".png", ".pdf", ".jpg", ".jpeg", ".svg")
