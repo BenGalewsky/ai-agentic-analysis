@@ -8,8 +8,9 @@ A trial:
      workspace containing a snapshot of ``skills/`` and runs the agent harness in it
      as a subprocess - Claude Code (``claude -p``, the default) or opencode
      (``opencode run``) - streaming JSON events.
-  4. Logs params, metrics, artifacts and an MLflow trace per question, each as a child
-     run of one parent run for the whole trial.
+  4. Logs the trial as one MLflow evaluation run - params, rolled-up metrics and
+     artifacts - with an MLflow trace per question, graded and annotated with the
+     record's expectations.
 
 Example:
     uv run run-trial

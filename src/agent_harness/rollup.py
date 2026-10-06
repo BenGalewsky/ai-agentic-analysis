@@ -1,80 +1,17 @@
-"""Roll repeat summaries up into question-run and trial-run metrics."""
+"""Roll repeat summaries up into trial-run metrics."""
 
 from __future__ import annotations
 
 from collections import Counter
-from statistics import fmean, stdev
+from statistics import fmean
 from typing import Any
-
-# Question metrics summed over the repeats as `<key>_total`; a sum of the others
-# (rates, relative errors) means nothing.
-ADDITIVE_METRICS = (
-    "wall_seconds",
-    "duration_ms",
-    "api_duration_ms",
-    "num_turns",
-    "cost_usd",
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_creation_tokens",
-    "num_tool_calls",
-    "num_tool_errors",
-    "num_skill_calls",
-    "num_mcp_calls",
-)
-
-
-def question_metrics(repeats: list[dict[str, Any]], skill_names: list[str]) -> dict[str, float]:
-    """Roll a question's repeats up into its run's metrics.
-
-    Each key holds the mean over the repeats - so a 0/1 outcome like
-    ``metrics_match`` becomes the share of repeats that passed - and, with more
-    than one repeat, ``<key>_std`` beside it and ``<key>_total`` for the additive
-    keys. A single repeat logs exactly its own values. A key a repeat did not log,
-    such as a plot's relative error when no METRIC line matched it, is averaged
-    over the repeats that did.
-    """
-    # Every repeat counts every skill any repeat used, so a skill's mean is over all of them.
-    skills = sorted({*skill_names, *(skill for r in repeats for skill in r["skill_calls"])})
-    for summary in repeats:
-        for skill in skills:
-            summary["metrics"][f"skill_calls_{skill}"] = summary["skill_calls"][skill]
-
-    metrics: dict[str, float] = {}
-    for key in dict.fromkeys(key for r in repeats for key in r["metrics"]):
-        values = [r["metrics"][key] for r in repeats if key in r["metrics"]]
-        metrics[key] = fmean(values)
-        if len(repeats) > 1:
-            if len(values) > 1:
-                metrics[f"{key}_std"] = stdev(values)
-            if key in ADDITIVE_METRICS:
-                metrics[f"{key}_total"] = sum(values)
-    return metrics
-
-
-def question_tags(repeats: list[dict[str, Any]]) -> dict[str, str]:
-    """A question run's tags: its only repeat's, or a summary across several."""
-    if len(repeats) == 1:
-        return {k: v for k, v in repeats[0]["tags"].items() if k not in ("question", "repeat")}
-    num_passed = sum(r["correct"] for r in repeats)
-    return {
-        "status": "success" if all(r["succeeded"] for r in repeats) else "failure",
-        "failure_reason": ",".join(
-            sorted({r["tags"]["failure_reason"] for r in repeats if not r["succeeded"]})
-        ),
-        "grade": "pass" if num_passed == len(repeats) else "fail",
-        "grade_message": f"{num_passed}/{len(repeats)} repeats passed",
-    }
 
 
 def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> dict[str, float]:
-    """Roll the question summaries up into the parent run's metrics.
+    """Roll the repeat summaries up into the trial run's metrics.
 
     Rates and means are what compare across trials of different sizes, e.g. a
     skills revision run over a subset of the questions; totals are kept for cost.
-    A rollup never reuses a question run's metric key - it is prefixed `total_` or
-    `mean_` - so a chart of a key holds one kind of value, whichever runs are shown.
     A value a harness does not report (``None``, e.g. opencode's API duration) is
     skipped, and its rollups left out when no repeat reported it.
     """
@@ -106,6 +43,8 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
         "completion_rate": mean("succeeded"),
         "total_correct": num_correct,
         "accuracy": mean("correct"),
+        # The same share under the name mlflow.genai.evaluate gives a scorer's mean.
+        "metrics_match/mean": mean("correct"),
         "pass_at_k": fmean(any(grades) for grades in grades_by_question.values()),
         "pass_all_k": fmean(all(grades) for grades in grades_by_question.values()),
         "total_produced_script": total("produced_script"),

@@ -1,4 +1,4 @@
-"""Run a trial: every question's repeats, each logged to MLflow under one parent run."""
+"""Run a trial: every question's repeats, each a trace on one MLflow evaluation run."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from typing import Any
 import mlflow
 from mlflow.entities import AssessmentSource, AssessmentSourceType
 from mlflow.exceptions import MlflowException
+from mlflow.tracing.constant import AssessmentMetadataKey
+from mlflow.utils.mlflow_tags import MLFLOW_RUN_TYPE, MLFLOW_RUN_TYPE_GENAI_EVALUATE
 
 from .config import SKILLS_DIR
 from .grader import grade, metrics_from_calls
@@ -19,8 +21,8 @@ from .harnesses import Harness
 from .mcp_config import mcp_server_names, read_mcp_config
 from .prompts import render_prompt
 from .questions import question_name
-from .rollup import question_metrics, question_tags, summary_table, trial_metrics
-from .tracing import link_traces, log_trace
+from .rollup import summary_table, trial_metrics
+from .tracing import log_trace
 from .workspace import find_deliverables, hash_skills, stage_workspace
 
 
@@ -32,16 +34,17 @@ def run_repeat(
     repeat: int,
     question_dir: Path,
 ) -> dict[str, Any]:
-    """Run one repeat of a question inside its active question run.
+    """Run one repeat of a question inside the active trial run.
 
-    Logs the repeat's artifacts (under ``r<k>/`` when there are several repeats)
-    and its trace, tagged and annotated with its own metrics, and returns its
-    summary; the question run's metrics are rolled up from these.
+    Logs the repeat's artifacts under ``<question>/`` (``<question>/r<k>/`` when
+    there are several repeats) and its trace, tagged and annotated with its own
+    metrics, its grade and the record's expectations, and returns its summary;
+    the trial run's metrics are rolled up from these.
     """
     name = question_name(record)
     repeated = args.repeats > 1
     repeat_dir = question_dir / f"r{repeat}" if repeated else question_dir
-    prefix = f"r{repeat}/" if repeated else ""
+    prefix = f"{name}/r{repeat}/" if repeated else f"{name}/"
     workspace = stage_workspace(repeat_dir, harness.skills_dir)
     print(f"workspace: {workspace}")
 
@@ -62,7 +65,7 @@ def run_repeat(
 
     for path in [stream_path, *extra_files]:
         if path.exists():
-            mlflow.log_artifact(str(path), artifact_path=prefix.rstrip("/") or None)
+            mlflow.log_artifact(str(path), artifact_path=prefix.rstrip("/"))
     if summary.result:
         mlflow.log_dict(summary.result, f"{prefix}result.json")
     if stderr:
@@ -111,8 +114,12 @@ def run_repeat(
     }
     # A value the harness does not report is left out rather than logged as 0.
     metrics = {key: value for key, value in metrics.items() if value is not None}
+    record_tags = record["tags"] or {}
     tags = {
         "question": name,
+        "question_index": record_tags.get("question_index", ""),
+        "datasets": record_tags.get("datasets", ""),
+        "dataset_record_id": record["dataset_record_id"],
         "repeat": str(repeat),
         "status": "success" if succeeded else "failure",
         "failure_reason": "" if succeeded else failure_reason,
@@ -125,21 +132,30 @@ def run_repeat(
         },
     }
 
-    trace_id = log_trace(harness.name, prompt_text, summary, succeeded, metrics, tags)
+    trace_id = log_trace(
+        harness.name, record["inputs"], prompt_text, summary, succeeded, metrics, tags
+    )
     # Traces are exported in the background, and the server's auth layer
     # answers 403 for a trace it has not stored yet - wait for the export.
     mlflow.flush_trace_async_logging()
     try:
+        # As mlflow.genai.evaluate does: the grade is feedback from this run, and
+        # the record's expectations sit beside it on the trace.
         mlflow.log_feedback(
             trace_id=trace_id,
             name="metrics_match",
             value=graded.passed,
             rationale=graded.message,
             source=AssessmentSource(source_type=AssessmentSourceType.CODE, source_id="grader.py"),
-            metadata={"tolerance": str(graded.tolerance)},
+            metadata={
+                "tolerance": str(graded.tolerance),
+                AssessmentMetadataKey.SOURCE_RUN_ID: mlflow.active_run().info.run_id,
+            },
         )
+        for key, value in (record.get("expectations") or {}).items():
+            mlflow.log_expectation(trace_id=trace_id, name=key, value=value)
     except MlflowException as e:
-        # The grade is already on the run; don't lose the sweep over the trace copy.
+        # The grade is already in grade.json; don't lose the sweep over the trace copy.
         print(f"warning  : could not attach grade to trace {trace_id}: {e.message}")
 
     print(f"status   : {'success' if succeeded else 'FAILURE'}")
@@ -185,49 +201,25 @@ def run_question(
     record: dict[str, Any],
     variables: dict[str, str],
     trial_dir: Path,
-    common_params: dict[str, Any],
-    skill_names: list[str],
-    tracking_uri: str,
 ) -> list[dict[str, Any]]:
-    """Run a question's repeats as one child run of the active trial run.
+    """Run a question's repeats in the active trial run, each repeat a trace on it.
 
-    Each repeat is a trace on the run; returns the repeats' summaries.
+    The question's own artifacts go under ``<question>/``; returns the repeats' summaries.
     """
     name = question_name(record)
-    tags = record["tags"] or {}
     prompt_text = render_prompt(prompt, {**record["inputs"], **variables})
     question_dir = trial_dir / name
 
-    with mlflow.start_run(
-        run_name=name, nested=True, tags={"run_type": "question", "harness": harness.name}
-    ) as run:
-        mlflow.log_params(
-            {
-                **common_params,
-                "question_name": name,
-                "question_index": tags.get("question_index", ""),
-                "dataset_record_id": record["dataset_record_id"],
-            }
-        )
-        mlflow.set_tags({"question": name, "datasets": tags.get("datasets", "")})
-        mlflow.log_text(prompt_text, "prompt.txt")
-        mlflow.log_dict(record["inputs"], "inputs.json")
-        if record.get("expectations"):
-            mlflow.log_dict(record["expectations"], "expectations.json")
+    mlflow.log_text(prompt_text, f"{name}/prompt.txt")
+    mlflow.log_dict(record["inputs"], f"{name}/inputs.json")
+    if record.get("expectations"):
+        mlflow.log_dict(record["expectations"], f"{name}/expectations.json")
 
-        repeats = []
-        for repeat in range(1, args.repeats + 1):
-            if args.repeats > 1:
-                print(f"-- repeat {repeat}/{args.repeats}")
-            repeats.append(run_repeat(args, harness, prompt_text, record, repeat, question_dir))
-
-        mlflow.log_metrics(question_metrics(repeats, skill_names))
-        mlflow.set_tags(question_tags(repeats))
-        print(f"run      : {run.info.run_id}")
-        print(f"ui       : {run_url(tracking_uri, run)}")
-
-    for summary in repeats:
-        summary["run_id"] = run.info.run_id
+    repeats = []
+    for repeat in range(1, args.repeats + 1):
+        if args.repeats > 1:
+            print(f"-- repeat {repeat}/{args.repeats}")
+        repeats.append(run_repeat(args, harness, prompt_text, record, repeat, question_dir))
     return repeats
 
 
@@ -247,7 +239,9 @@ def run_trial(
     variables: dict[str, str],
     tracking_uri: str,
 ) -> bool:
-    """Run the questions as child runs of one parent trial run; return whether every repeat completed."""
+    """Run the questions in one trial run, an MLflow evaluation run with a trace per
+    repeat of each question; return whether every repeat completed.
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     trial_dir = args.trials_dir / f"{stamp}-{prompt.name}-v{prompt.version}-{harness.name}"
     skills_hash = hash_skills(SKILLS_DIR)
@@ -264,8 +258,7 @@ def run_trial(
         print(f"mcp      : {', '.join(mcp_server_names(args.mcp_config))}")
     print(f"trial dir: {trial_dir}")
 
-    # Shared by the trial run and every question run, so child runs compare on their own.
-    common_params = {
+    params = {
         "prompt_name": prompt.name,
         "prompt_version": prompt.version,
         "prompt_uri": prompt.uri,
@@ -281,20 +274,23 @@ def run_trial(
         "skills": ",".join(skill_names),
         "num_skills": len(skill_names),
         "num_repeats": args.repeats,
+        "question_filter": ",".join(args.question),
+        "num_questions": len(records),
     }
 
     run_name = args.run_name or f"{prompt.name}-v{prompt.version}-{harness.name}-{stamp}"
-    # Tagged so the trial runs filter out with `tags.run_type = 'trial'`.
+    # Tagged so the trial runs filter out with `tags.run_type = 'trial'`, and as an
+    # evaluation run - with the dataset as its input - like mlflow.genai.evaluate's.
     with mlflow.start_run(
-        run_name=run_name, tags={"run_type": "trial", "harness": harness.name}
+        run_name=run_name,
+        tags={
+            "run_type": "trial",
+            "harness": harness.name,
+            MLFLOW_RUN_TYPE: MLFLOW_RUN_TYPE_GENAI_EVALUATE,
+        },
     ) as run:
-        mlflow.log_params(
-            {
-                **common_params,
-                "question_filter": ",".join(args.question),
-                "num_questions": len(records),
-            }
-        )
+        mlflow.log_params(params)
+        mlflow.log_input(dataset)
         mlflow.log_text(prompt.template, "prompt_template.txt")
         for i, config in enumerate(args.mcp_config):
             mlflow.log_text(read_mcp_config(config), f"mcp_config_{i}.json" if i else "mcp_config.json")
@@ -305,19 +301,8 @@ def run_trial(
         summaries = []
         for i, record in enumerate(records, 1):
             print(f"\n[{i}/{len(records)}] {question_name(record)}")
-            summaries += run_question(
-                args,
-                harness,
-                prompt,
-                record,
-                variables,
-                trial_dir,
-                common_params,
-                skill_names,
-                tracking_uri,
-            )
+            summaries += run_question(args, harness, prompt, record, variables, trial_dir)
 
-        link_traces([s["trace_id"] for s in summaries if s["trace_id"]], run.info.run_id)
         metrics = trial_metrics(summaries, skill_names)
         mlflow.log_metrics(metrics)
         mlflow.log_table(summary_table(summaries), artifact_file="questions.json")

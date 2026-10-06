@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import mlflow
 from mlflow.entities import SpanStatusCode, SpanType
-from mlflow.exceptions import MlflowException
 
 from .harnesses import RunSummary
 
 
 def log_trace(
     harness: str,
+    inputs: dict[str, Any],
     prompt_text: str,
     summary: RunSummary,
     succeeded: bool,
@@ -21,11 +23,17 @@ def log_trace(
 
     A repeat that produced no events (a timeout, a failed launch) still gets an
     error trace, so every repeat of a question is accounted for among its traces.
+
+    The trace's inputs are the dataset record's, so traces of the same question
+    line up across trials - even ones run with different prompt versions - and the
+    rendered prompt is an attribute of the agent span. Started inside the trial
+    run, the trace belongs to it.
     """
     root = mlflow.start_span_no_context(
         name=f"{harness}_trial",
         span_type=SpanType.AGENT,
-        inputs={"prompt": prompt_text},
+        inputs=inputs,
+        attributes={"prompt": prompt_text},
         tags=tags,
     )
     try:
@@ -51,15 +59,3 @@ def log_trace(
         root.end(status=SpanStatusCode.ERROR)
         raise
 
-
-def link_traces(trace_ids: list[str], run_id: str) -> None:
-    """Link the question traces to the trial run too, so the trial's traces can be
-    compared across trials. Each trace stays on its question run as well.
-    """
-    client = mlflow.MlflowClient()
-    for start in range(0, len(trace_ids), 100):  # the API takes at most 100 per call
-        chunk = trace_ids[start : start + 100]
-        try:
-            client.link_traces_to_run(chunk, run_id)
-        except MlflowException as e:
-            print(f"warning  : could not link {len(chunk)} trace(s) to the trial run: {e.message}")
