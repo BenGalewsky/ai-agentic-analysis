@@ -177,7 +177,7 @@ def main() -> int:
 
     variables = dict(v.split("=", 1) for v in args.var)
     prompt = resolve_prompt(args.prompt, args.prompt_version)
-    dataset, records = load_questions(args.dataset)
+    dataset, records = load_questions(args.dataset, args.experiment)
     if args.question:
         records = [select_question(records, key) for key in args.question]
     if args.limit is not None:

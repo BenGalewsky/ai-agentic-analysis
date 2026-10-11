@@ -1,0 +1,13 @@
+apiVersion: v2
+name: mlflow-stack
+description: MLflow tracking server backed by Postgres, with artifacts in the cluster's Ceph object store
+type: application
+version: 0.1.0
+appVersion: "3.17.0"
+dependencies:
+  - name: mlflow
+    version: 3.17.0
+    repository: oci://ghcr.io/mlflow/charts
+  - name: postgres
+    version: 1.6.8
+    repository: https://groundhog2k.github.io/helm-charts/

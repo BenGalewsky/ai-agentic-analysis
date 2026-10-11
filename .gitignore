@@ -28,3 +28,6 @@ mlartifacts/
 .idea/
 .vscode/
 .DS_Store
+
+# Helm dependencies (fetched by `helm dependency build`, pinned in Chart.lock)
+helm/charts/

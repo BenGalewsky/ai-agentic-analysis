@@ -1,0 +1,10 @@
+MLflow is being deployed with:
+  - backend store: Postgres at {{ .Values.postgres.fullnameOverride }}:5432 (credentials from Secret mlflow-db)
+  - artifacts:     {{ .Values.mlflow.mlflow.artifactsDestination }}
+{{- range .Values.mlflow.ingress.hosts }}
+  - UI:            https://{{ .host }}
+{{- end }}
+
+If the mlflow pod is stuck in Init or CreateContainerConfigError, check that the
+Secrets mlflow-db, mlflow-auth-secret, mlflow-auth-config and the bucket
+Secret/ConfigMap mlflow exist in namespace {{ .Release.Namespace }}.

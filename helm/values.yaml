@@ -1,0 +1,154 @@
+# Values for the upstream MLflow chart (oci://ghcr.io/mlflow/charts/mlflow).
+mlflow:
+  # Pin resource names so they don't depend on the release name. The admin's
+  # ObjectBucketClaim already owns a Secret and ConfigMap called `mlflow`, but
+  # this chart creates neither kind, so there is no collision.
+  fullnameOverride: mlflow
+
+  mlflow:
+    # Tracking and model-registry metadata live in Postgres. The URI embeds the
+    # database password, so it is read from the pre-created `mlflow-db` Secret
+    # (see examples/secrets.example.yaml) rather than written here.
+    backendStoreUriFrom:
+      secretKeyRef:
+        name: mlflow-db
+        key: uri
+    # The server proxies artifact uploads/downloads into the Ceph object store
+    # bucket provisioned by the cluster admin. Set here rather than under `env`:
+    # the chart already renders MLFLOW_ARTIFACTS_DESTINATION from this key, and
+    # listing it in `env` too would produce a duplicate variable.
+    artifactsDestination: s3://mlflow-7e8e80c9-52cf-4e17-841c-71572b271cc4
+
+  server:
+    value_options:
+      app_name: basic-auth
+      # MLflow's DNS-rebinding middleware rejects any Host header not on this
+      # list with a 403 ("Invalid Host header"). The default list is localhost
+      # plus RFC1918 private IPs, which the ingress hostname is not, so it has to
+      # be named explicitly. Note this REPLACES the defaults rather than adding
+      # to them: in-cluster clients that address the Service by its DNS name
+      # instead of going through the ingress would need to be added here too.
+      # /health and /version are exempt, so probes pass either way.
+      allowed_hosts: mlflow2.servicex.ssl-hep.org
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      acme.cert-manager.io/http01-edit-in-place: "true"
+      # MLflow proxies artifact uploads through the server; nginx's 1m default
+      # body size would reject anything larger than a trivial model.
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    hosts:
+      - host: mlflow2.servicex.ssl-hep.org
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: mlflow-tls
+        hosts:
+          - mlflow2.servicex.ssl-hep.org
+
+  # Bucket credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) and bucket
+  # details (BUCKET_HOST, BUCKET_NAME, ...) from the admin's ObjectBucketClaim.
+  # boto3 picks the credentials up from the environment.
+  envFrom:
+    - secretRef:
+        name: mlflow
+    - configMapRef:
+        name: mlflow
+
+  env:
+    # In-cluster Ceph RGW endpoint for the bucket above.
+    - name: MLFLOW_S3_ENDPOINT_URL
+      value: http://rook-ceph-rgw-ssl-store.rook-ceph.svc
+    # Companion to `allowed_hosts` above: a second middleware checks the Origin
+    # header on state-changing API calls (POST/PUT/DELETE/PATCH under /api/ and
+    # /ajax-api/) and 403s anything not on this list. The list has no default
+    # beyond localhost, and the server has no idea what its own public origin is
+    # behind the TLS-terminating ingress -- so the UI's own POSTs, which browsers
+    # tag with an Origin header even same-origin, get blocked until the ingress
+    # URL is named here. Symptom: reads work, "create role"/"create experiment"
+    # fail with "You do not have permission to access this resource."
+    # Scheme and host must match the browser's address bar exactly.
+    - name: MLFLOW_SERVER_CORS_ALLOWED_ORIGINS
+      value: https://mlflow2.servicex.ssl-hep.org
+    - name: MLFLOW_FLASK_SERVER_SECRET_KEY
+      valueFrom:
+        secretKeyRef:
+          name: mlflow-auth-secret
+          key: secret-key
+    # The basic-auth app keeps its own user/permission database, separate from
+    # the backend store, and the only way to configure it is a full replacement
+    # ini file. Its `database_uri` points at the same Postgres database as the
+    # backend store; the auth migrations track themselves in their own
+    # `alembic_version_auth` table, so the two schemas coexist.
+    - name: MLFLOW_AUTH_CONFIG_PATH
+      value: /etc/mlflow/basic_auth.ini
+
+  # Hold the server back until Postgres accepts connections, so the first
+  # rollout doesn't crash-loop while the database initialises.
+  #
+  # `-U` is required: the pod runs as UID 1000, which has no passwd entry in
+  # the postgres image, so without it libpq can't derive a default user name
+  # and pg_isready reports "no attempt" forever. pg_isready never
+  # authenticates, so any user name will do.
+  extraInitContainers:
+    - name: wait-for-postgres
+      image: docker.io/postgres:18.6
+      command:
+        - sh
+        - -c
+        - until pg_isready -U postgres -h mlflow-postgres -p 5432; do echo waiting for postgres; sleep 2; done
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+  # Nothing is persisted locally any more -- metadata and auth data are in
+  # Postgres and artifacts are in the object store -- so the chart's `storage`
+  # PVC stays disabled. That also lets the chart use a RollingUpdate strategy.
+  # Only the auth config secret needs mounting.
+  extraVolumes:
+    - name: auth-config
+      secret:
+        secretName: mlflow-auth-config
+
+  extraVolumeMounts:
+    - name: auth-config
+      mountPath: /etc/mlflow
+      readOnly: true
+
+# Values for the groundhog2k Postgres chart (https://groundhog2k.github.io/helm-charts/).
+postgres:
+  # Pinned because the connection URIs in the `mlflow-db` and
+  # `mlflow-auth-config` Secrets hard-code the Service name `mlflow-postgres`.
+  fullnameOverride: mlflow-postgres
+
+  # All credentials come from the pre-created `mlflow-db` Secret. On first
+  # start (empty data directory only) the image creates the POSTGRES_DB
+  # database and the chart's init script creates USERDB_USER as its owner.
+  # Changing these values afterwards has no effect on an existing database --
+  # rotate passwords with ALTER USER and then update the Secrets.
+  settings:
+    existingSecret: mlflow-db
+    superuserPassword:
+      secretKey: POSTGRES_PASSWORD
+
+  userDatabase:
+    existingSecret: mlflow-db
+    name:
+      secretKey: POSTGRES_DB
+    user:
+      secretKey: USERDB_USER
+    password:
+      secretKey: USERDB_PASSWORD
+
+  # The StatefulSet's volumeClaimTemplate creates this PVC. StatefulSet PVCs
+  # are not deleted by `helm uninstall`; remove it by hand to start over.
+  storage:
+    requestedSize: 10Gi
+    className: rook-ceph-block
