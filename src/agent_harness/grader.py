@@ -41,7 +41,7 @@ from typing import Any
 from mlflow.entities import Feedback, SpanType
 from mlflow.genai.scorers import scorer
 
-from .config import DEFAULT_DATASET, connect_mlflow
+from .config import DEFAULT_DATASET, DEFAULT_EXPERIMENT, connect_mlflow
 from .harnesses import HARNESSES, Harness, ToolCall, read_events
 from .questions import load_questions, question_name
 
@@ -262,9 +262,9 @@ def run_label(qdir: Path) -> str:
     return f"{qdir.parent.name}-{qdir.name}" if REPEAT_DIR.fullmatch(qdir.name) else qdir.name
 
 
-def load_expectations(dataset_name: str) -> dict[str, dict[str, Any]]:
+def load_expectations(dataset_name: str, experiment: str) -> dict[str, dict[str, Any]]:
     """Each record's expectations, keyed by the name its trial directory is given."""
-    _, records = load_questions(dataset_name)
+    _, records = load_questions(dataset_name, experiment)
     return {question_name(r): r["expectations"] for r in records}
 
 
@@ -289,13 +289,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="+", type=Path, help="Trial or question directories")
     ap.add_argument("--dataset", default=DEFAULT_DATASET)
+    ap.add_argument("--experiment", default=DEFAULT_EXPERIMENT, help="Experiment the dataset is linked to")
     ap.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE, help="Relative tolerance")
     ap.add_argument("--check-avg-entries", action="store_true", help="Also gate on avg_entries_per_event")
     ap.add_argument("--json", action="store_true", help="Print grades as JSON")
     args = ap.parse_args()
 
     connect_mlflow()
-    expectations = load_expectations(args.dataset)
+    expectations = load_expectations(args.dataset, args.experiment)
 
     dirs = question_dirs(args.paths)
     if not dirs:

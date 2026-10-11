@@ -4,12 +4,21 @@ from __future__ import annotations
 
 from typing import Any
 
-from mlflow.genai.datasets import get_dataset
+from mlflow import MlflowClient
+from mlflow.genai.datasets import search_datasets
 
 
-def load_questions(name: str) -> tuple[Any, list[dict[str, Any]]]:
+def load_questions(name: str, experiment: str) -> tuple[Any, list[dict[str, Any]]]:
     """Load the dataset and its records, in the order of their ``question_index`` tag."""
-    dataset = get_dataset(name=name)
+    # Search within the experiment: the basic-auth server rejects dataset searches
+    # without experiment_ids (which get_dataset(name=...) sends) with a 403.
+    exp = MlflowClient().get_experiment_by_name(experiment)
+    if exp is None:
+        raise SystemExit(f"Experiment {experiment!r} not found")
+    found = search_datasets(experiment_ids=exp.experiment_id, filter_string=f'name = "{name}"', max_results=1)
+    if not found:
+        raise SystemExit(f"Dataset {name!r} not found in experiment {experiment!r}")
+    dataset = found[0]
     records = dataset.to_df().to_dict("records")
     if not records:
         raise SystemExit(f"Dataset {name!r} has no records")

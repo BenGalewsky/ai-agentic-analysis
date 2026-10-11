@@ -26,8 +26,7 @@ import urllib.request
 import mlflow
 import yaml
 from dotenv import load_dotenv
-from mlflow.exceptions import MlflowException
-from mlflow.genai.datasets import EvaluationDataset, create_dataset, get_dataset
+from mlflow.genai.datasets import EvaluationDataset, create_dataset, search_datasets
 
 COMMIT = "7ba7f67dcf9332f0235fd8204dc923b0842240c3"
 SOURCE_URL = (
@@ -88,16 +87,18 @@ def record_for(name: str, q: dict, index: int) -> dict:
 
 
 def get_or_create_dataset(experiment_id: str) -> EvaluationDataset:
-    try:
-        return get_dataset(name=DATASET_NAME)
-    except MlflowException as e:
-        if e.error_code != "RESOURCE_DOES_NOT_EXIST":
-            raise
-        return create_dataset(
-            name=DATASET_NAME,
-            experiment_id=experiment_id,
-            tags={"source": "hep-data-llm/questions.yaml", "source_commit": COMMIT},
-        )
+    # Scope the lookup to the experiment: the basic-auth server rejects dataset searches
+    # without experiment_ids (which get_dataset(name=...) sends) with a 403.
+    found = search_datasets(
+        experiment_ids=experiment_id, filter_string=f'name = "{DATASET_NAME}"', max_results=1
+    )
+    if found:
+        return found[0]
+    return create_dataset(
+        name=DATASET_NAME,
+        experiment_id=experiment_id,
+        tags={"source": "hep-data-llm/questions.yaml", "source_commit": COMMIT},
+    )
 
 
 def stale_record_ids(dataset: EvaluationDataset, records: list[dict]) -> list[str]:
