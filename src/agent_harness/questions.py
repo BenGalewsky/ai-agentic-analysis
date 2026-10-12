@@ -22,12 +22,16 @@ def load_questions(name: str, experiment: str) -> tuple[Any, list[dict[str, Any]
     records = dataset.to_df().to_dict("records")
     if not records:
         raise SystemExit(f"Dataset {name!r} has no records")
-    records.sort(key=lambda r: int((r["tags"] or {}).get("question_index", 0)))
+    records.sort(key=lambda r: int(question_index(r) or 0))
     return dataset, records
 
 
 def question_name(record: dict[str, Any]) -> str:
     return (record["tags"] or {}).get("name") or record["dataset_record_id"]
+
+
+def question_index(record: dict[str, Any]) -> str:
+    return (record["tags"] or {}).get("question_index", "")
 
 
 def select_question(records: list[dict[str, Any]], key: str) -> dict[str, Any]:

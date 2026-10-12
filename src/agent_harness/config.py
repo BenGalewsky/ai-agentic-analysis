@@ -21,6 +21,8 @@ DEFAULT_TRIALS_DIR = Path(
 DEFAULT_EXPERIMENT = "hep-plot-agent"
 # Where --scheme per-question logs its runs, apart from the omnibus trials.
 DEFAULT_QUESTION_EXPERIMENT = "hep-plot-agent-questions"
+# The experiment each --scheme logs to by default.
+SCHEME_EXPERIMENTS = {"omnibus": DEFAULT_EXPERIMENT, "per-question": DEFAULT_QUESTION_EXPERIMENT}
 DEFAULT_PROMPT = "IRIS-HEP"
 DEFAULT_DATASET = "hep-data-llm-questions"
 # Claude Code's --allowed-tools default.

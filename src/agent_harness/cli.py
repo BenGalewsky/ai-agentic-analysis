@@ -39,6 +39,7 @@ from .config import (
     DEFAULT_PROMPT,
     DEFAULT_QUESTION_EXPERIMENT,
     DEFAULT_TRIALS_DIR,
+    SCHEME_EXPERIMENTS,
     connect_mlflow,
 )
 from .harnesses import HARNESSES
@@ -98,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scheme",
         default="omnibus",
-        choices=["omnibus", "per-question"],
+        choices=list(SCHEME_EXPERIMENTS),
         help="omnibus: one evaluation run for the whole trial (default); per-question: an "
         "evaluation run per question, its repeats as the run's traces",
     )
@@ -188,10 +189,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.experiment is None:
-        args.experiment = (
-            DEFAULT_QUESTION_EXPERIMENT if args.scheme == "per-question" else DEFAULT_EXPERIMENT
-        )
+    args.experiment = args.experiment or SCHEME_EXPERIMENTS[args.scheme]
     tracking_uri = connect_mlflow()
 
     if args.no_mcp:

@@ -97,14 +97,15 @@ def trial_metrics(summaries: list[dict[str, Any]], skill_names: list[str]) -> di
     return {key: value for key, value in metrics.items() if value is not None}
 
 
-# Per-repeat values whose spread over a question's repeats shows how much it varies,
-# by the name of their std_ metric (matching the trial metrics' mean_ names).
+# Per-repeat trace metrics whose spread over a question's repeats shows how much it
+# varies, by the name of their std_ metric (matching the trial metrics' mean_ names).
 SPREAD_KEYS = {
-    "cost_usd": "cost",
+    "cost_usd": "cost_usd",
     "wall_seconds": "wall_seconds",
     "turns": "num_turns",
     "tool_calls": "num_tool_calls",
     "tool_errors": "num_tool_errors",
+    "skill_calls": "num_skill_calls",
     "skill_file_reads": "num_skill_file_reads",
     "mcp_calls": "num_mcp_calls",
 }
@@ -117,10 +118,9 @@ def spread_metrics(summaries: list[dict[str, Any]]) -> dict[str, float]:
     deviation needs two reported values, and is left out with fewer.
     """
     values = {
-        name: [s[key] for s in summaries if s[key] is not None]
+        name: [s["metrics"][key] for s in summaries if key in s["metrics"]]
         for name, key in SPREAD_KEYS.items()
     }
-    values["skill_calls"] = [s["skill_calls"].total() for s in summaries]
     return {
         "num_attempts": len(summaries),
         **{f"std_{name}": pstdev(vals) for name, vals in values.items() if len(vals) > 1},
