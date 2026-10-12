@@ -32,12 +32,17 @@ trial per harness also answers *how much does the harness itself matter?*
    | `claude` (default) | `claude --print --output-format stream-json` | `.claude/skills` | `claude_stream.jsonl` |
    | `opencode` | `opencode run --standalone --format json --auto` | `.opencode/skills` | `opencode_stream.jsonl` |
 
-4. Logs the whole trial as one MLflow evaluation run, the shape
-   `mlflow.genai.evaluate` gives its runs: the dataset as the run's input, an
-   MLflow trace per question (one child span per tool call) carrying the grade
-   and the record's expectations, and the aggregate completion rate, accuracy
-   and cost as run metrics. With `--repeats N` the question is run N times, each
-   repeat a trace of its own.
+4. Logs to MLflow evaluation runs, the shape `mlflow.genai.evaluate` gives its
+   runs: the dataset as the run's input, an MLflow trace per question (one child
+   span per tool call) carrying the grade and the record's expectations, and the
+   aggregate completion rate, accuracy and cost as run metrics. With
+   `--repeats N` the question is run N times, each repeat a trace of its own.
+   `--scheme` chooses how the traces are split into runs:
+
+   | `--scheme` | Runs | Default experiment | For |
+   | --- | --- | --- | --- |
+   | `omnibus` (default) | One run for the whole trial | `hep-plot-agent` | Comparing the effect of a skills or prompt change across the benchmark |
+   | `per-question` | One run per question, its repeats the run's traces | `hep-plot-agent-questions` | Digging into how the agent and its skills handle one question, and how much that varies from attempt to attempt |
 
 Deliverables — the most recently modified `.py` and the most recently modified
 image — are promoted to the `final/` artifact path, so a plot is always in the
@@ -170,6 +175,19 @@ uv run run-trial --question JetPtAll --repeats 5
 uv run run-trial --prompt IRIS-HEP --prompt-version 1 --model opus
 ```
 
+Run each question as its own evaluation run, with five attempts at it, to see how
+the skills are applied to it and how much that varies:
+
+```bash
+uv run run-trial --scheme per-question --question JetPtAll --repeats 5
+uv run run-trial --scheme per-question --repeats 3
+```
+
+These go to the `hep-plot-agent-questions` experiment unless `--experiment` says
+otherwise. The question runs of one invocation make up a *sweep*, and share its ID
+(`<timestamp>-<prompt>-v<version>-<harness>`, the name of its trial directory) as
+their `sweep` tag; the harness prints the filter that lists them.
+
 Compare the harnesses by running a trial with each, on the same questions:
 
 ```bash
@@ -187,8 +205,10 @@ Useful options:
 | `--limit` | Run only the first N questions, by `question_index` |
 | `--repeats` | Run each question N times (default: 1) |
 | `--var KEY=VALUE` | Fill a prompt template variable (repeatable, overrides the dataset's inputs) |
-| `--experiment` | MLflow experiment name (default: `hep-plot-agent`) |
-| `--run-name` | Name of the parent trial run (default: `<prompt>-v<version>-<harness>-<timestamp>`) |
+| `--scheme` | `omnibus`: one evaluation run for the trial (default); `per-question`: an evaluation run per question |
+| `--experiment` | MLflow experiment name (default: `hep-plot-agent`, or `hep-plot-agent-questions` with `--scheme per-question`) |
+| `--dataset-experiment` | Experiment the dataset is linked to, where it is looked up (default: `hep-plot-agent`) |
+| `--run-name` | Name of the trial run (default: `<prompt>-v<version>-<harness>-<timestamp>`); with `--scheme per-question`, a prefix for each question run's name (default: `<question>-<prompt>-v<version>-<harness>-<timestamp>`) |
 | `--harness` | Agent harness: `claude` (default) or `opencode` |
 | `--harness-bin` | Path to the harness's CLI (default: `claude` or `opencode` on `PATH`) |
 | `--model` | Model passed to the harness, e.g. `opus` for claude, `lumen/qwen3-coder-next` for opencode |
@@ -248,6 +268,9 @@ METRIC lines from a logged trace's tool spans, so `mlflow.genai.evaluate` can re
 
 ## What gets recorded
 
+Everything below describes an omnibus trial run; a per-question run differs as
+described under [Per-question runs](#per-question-runs).
+
 **Tags** — every trial run carries `run_type = trial`, `harness`, and
 `mlflow.runType = genai_evaluate`, which lists it under the experiment's
 **Evaluation runs**. Trials logged before question runs were folded into the
@@ -260,7 +283,7 @@ tags.run_type = 'trial'
 
 and add `and tags.harness = 'opencode'` to narrow them to one harness.
 
-**Params** — the harness and its version, prompt name/version/URI, dataset name
+**Params** — the scheme, the harness and its version, prompt name/version/URI, dataset name
 and ID, model, permission mode, the MCP config path and the server names it
 declares, the skill list and its content hash, and `num_repeats`; for claude also
 the allowed tools and `strict_mcp_config`; and the question filter and count.
@@ -326,6 +349,43 @@ across prompt versions, since the request is the question rather than the
 rendered prompt. With `--repeats`, the extra repeats of a question have no
 partner and show as rows of their own.
 
+### Per-question runs
+
+With `--scheme per-question`, each question is an evaluation run of its own,
+holding what a trial run holds but for that question alone:
+
+- **Tags** — `run_type = question`, `harness`, `question`, `question_index` and
+  `sweep`, so `tags.sweep = '<id>'` lists one invocation's runs and
+  `tags.question = 'JetPtAll'` one question's runs across sweeps.
+- **Params** — the trial's, with `sweep`, `question_name`, `question_index`,
+  `dataset_record_id` and `num_questions = 1` in place of `question_filter`.
+- **Metrics** — the trial rollups above, taken over the question's repeats (so
+  `accuracy` is the share of attempts that passed), plus `num_attempts` and the
+  standard deviation across attempts of `cost_usd`, `wall_seconds`, `turns`,
+  `tool_calls`, `tool_errors`, `skill_calls`, `skill_file_reads` and `mcp_calls`
+  as `std_<name>`, logged when there are at least two attempts.
+- **Artifacts** — the question's files sit at the root of the run rather than
+  under `<question>/`: `prompt.txt`, `inputs.json`, `expectations.json`, and
+  each repeat's under `r<k>/` (e.g. `r2/final/`).
+- **Traces** — one per attempt, so the run's **Traces** tab lines the attempts
+  up side by side, and **compare to** another sweep's run of the same question
+  matches them up.
+
+On disk, a sweep is staged exactly like a trial, so `grade-trial` regrades it the
+same way.
+
+To label a set of runs for comparison, tag them with a `scenario`:
+
+```bash
+uv run scripts/tag_scenario.py <trial_run_id> baseline
+uv run scripts/tag_scenario.py --sweep <sweep_id> baseline
+```
+
+The first tags a trial run (and, for older trials, its question child runs); the
+second every question run of a sweep, looked up in `hep-plot-agent-questions`
+unless `--experiment` names another. `--dry-run` lists the runs without tagging
+them.
+
 ## Skills
 
 The skills staged into each workspace cover the HEP Python stack:
@@ -360,7 +420,7 @@ one. `--global-skills` turns the isolation off, and is logged as the
 ```
 src/agent_harness/       # the harness package
   cli.py                 # run-trial: options and setup
-  trial.py               # runs the questions and their repeats under one trial run
+  trial.py               # runs the questions and their repeats, as one trial run or a run per question
   harnesses/             # the agents a trial can run, each read into one RunSummary
     base.py              # the Harness interface and the subprocess loop
     claude.py            # claude -p and its stream-json events
@@ -371,6 +431,7 @@ src/agent_harness/       # the harness package
   grader.py              # grade-trial: scores a trial's METRIC lines against the expectations
 scripts/
   register_questions.py  # loads the benchmark questions into the MLflow dataset
+  tag_scenario.py        # tags a trial run, or a sweep's question runs, with a scenario
 mcp.json        # MCP servers the agent gets in every trial
 skills/         # domain skills staged into every trial workspace
 trials/         # local trial output (gitignored)
