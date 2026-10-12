@@ -29,7 +29,7 @@ mlflow:
       # to them: in-cluster clients that address the Service by its DNS name
       # instead of going through the ingress would need to be added here too.
       # /health and /version are exempt, so probes pass either way.
-      allowed_hosts: mlflow2.servicex.ssl-hep.org
+      allowed_hosts: mlflow.servicex.ssl-hep.org
 
   ingress:
     enabled: true
@@ -41,14 +41,14 @@ mlflow:
       # body size would reject anything larger than a trivial model.
       nginx.ingress.kubernetes.io/proxy-body-size: "0"
     hosts:
-      - host: mlflow2.servicex.ssl-hep.org
+      - host: mlflow.servicex.ssl-hep.org
         paths:
           - path: /
             pathType: Prefix
     tls:
       - secretName: mlflow-tls
         hosts:
-          - mlflow2.servicex.ssl-hep.org
+          - mlflow.servicex.ssl-hep.org
 
   # Bucket credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) and bucket
   # details (BUCKET_HOST, BUCKET_NAME, ...) from the admin's ObjectBucketClaim.
@@ -73,7 +73,7 @@ mlflow:
     # fail with "You do not have permission to access this resource."
     # Scheme and host must match the browser's address bar exactly.
     - name: MLFLOW_SERVER_CORS_ALLOWED_ORIGINS
-      value: https://mlflow2.servicex.ssl-hep.org
+      value: https://mlflow.servicex.ssl-hep.org
     - name: MLFLOW_FLASK_SERVER_SECRET_KEY
       valueFrom:
         secretKeyRef:
@@ -86,6 +86,18 @@ mlflow:
     # `alembic_version_auth` table, so the two schemas coexist.
     - name: MLFLOW_AUTH_CONFIG_PATH
       value: /etc/mlflow/basic_auth.ini
+    # Every gunicorn worker opens a separate SQLAlchemy pool per store (tracking,
+    # model registry, auth, jobs), and SQLAlchemy's default of 5 + 10 overflow
+    # per pool let the 4 workers outrun Postgres's connection limit under trace
+    # logging load ("remaining connection slots are reserved..."). At 3 + 2 a pod
+    # tops out at 4 workers x 4 pools x 5 = 80 connections, so two pods side by
+    # side during a rolling update still fit under `max_connections` below;
+    # requests beyond a pool's size wait for a connection instead of failing.
+    # MLflow ignores a value of 0 for either, so overflow can't be switched off.
+    - name: MLFLOW_SQLALCHEMYSTORE_POOL_SIZE
+      value: "3"
+    - name: MLFLOW_SQLALCHEMYSTORE_MAX_OVERFLOW
+      value: "2"
 
   # Hold the server back until Postgres accepts connections, so the first
   # rollout doesn't crash-loop while the database initialises.
@@ -146,6 +158,13 @@ postgres:
       secretKey: USERDB_USER
     password:
       secretKey: USERDB_PASSWORD
+
+  # Headroom over the default of 100 for the MLflow pools sized above (see the
+  # MLFLOW_SQLALCHEMYSTORE_* comment). The image's entrypoint prepends
+  # `postgres` to arguments that start with a dash.
+  args:
+    - -c
+    - max_connections=200
 
   # The StatefulSet's volumeClaimTemplate creates this PVC. StatefulSet PVCs
   # are not deleted by `helm uninstall`; remove it by hand to start over.
