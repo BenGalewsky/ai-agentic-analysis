@@ -27,7 +27,7 @@ from .grader import grade, metrics_from_calls
 from .harnesses import Harness
 from .mcp_config import mcp_server_names, read_mcp_config
 from .prompts import render_prompt
-from .questions import question_name
+from .questions import question_index, question_name
 from .rollup import spread_metrics, summary_table, trial_metrics
 from .tracing import log_trace
 from .workspace import find_deliverables, hash_skills, stage_workspace
@@ -122,11 +122,10 @@ def run_repeat(
     }
     # A value the harness does not report is left out rather than logged as 0.
     metrics = {key: value for key, value in metrics.items() if value is not None}
-    record_tags = record["tags"] or {}
     tags = {
         "question": name,
-        "question_index": record_tags.get("question_index", ""),
-        "datasets": record_tags.get("datasets", ""),
+        "question_index": question_index(record),
+        "datasets": (record["tags"] or {}).get("datasets", ""),
         "dataset_record_id": record["dataset_record_id"],
         "repeat": str(repeat),
         "status": "success" if succeeded else "failure",
@@ -257,7 +256,8 @@ def eval_run(
     and log what the agent was given: params, prompt template, MCP config and skills.
     """
     with mlflow.start_run(
-        run_name=run_name, tags={**tags, MLFLOW_RUN_TYPE: MLFLOW_RUN_TYPE_GENAI_EVALUATE}
+        run_name=run_name,
+        tags={**tags, "harness": harness.name, MLFLOW_RUN_TYPE: MLFLOW_RUN_TYPE_GENAI_EVALUATE},
     ) as run:
         mlflow.log_params(params)
         mlflow.log_input(dataset)
@@ -273,33 +273,35 @@ def eval_run(
 def finish_run(
     summaries: list[dict[str, Any]],
     skill_names: list[str],
-    extra_metrics: dict[str, float] | None = None,
-) -> dict[str, float]:
-    """Roll the active run's repeats up into its metrics and summary table; return the metrics."""
-    metrics = {**trial_metrics(summaries, skill_names), **(extra_metrics or {})}
+    extra_metrics: dict[str, float],
+) -> tuple[dict[str, float], bool]:
+    """Roll the active run's repeats up into its metrics and summary table; return the
+    metrics and whether every repeat completed.
+    """
+    metrics = {**trial_metrics(summaries, skill_names), **extra_metrics}
     mlflow.log_metrics(metrics)
     mlflow.log_table(summary_table(summaries), artifact_file="questions.json")
     all_succeeded = metrics["total_completed"] == len(summaries)
     mlflow.set_tag("status", "success" if all_succeeded else "failure")
-    return metrics
+    return metrics, all_succeeded
 
 
 def print_run_summary(
     args: argparse.Namespace,
-    label: str,
     run,
     metrics: dict[str, float],
     summaries: list[dict[str, Any]],
     tracking_uri: str,
 ) -> None:
     n = len(summaries)
-    unit = "questions" if label == "trial" else "repeats"
+    omnibus = args.scheme == "omnibus"
+    label, unit = ("trial", "questions") if omnibus else ("run", "repeats")
     print(
         f"\n{label:9}: {run.info.run_id}  ({metrics['total_completed']}/{n} completed, "
         f"{metrics['total_correct']}/{n} correct)"
     )
     # A question run's pass@k is just whether any repeat passed, which the line above shows.
-    if args.repeats > 1 and label == "trial":
+    if args.repeats > 1 and omnibus:
         print(
             f"repeats  : pass@{args.repeats} {metrics['pass_at_k']:.0%}, "
             f"all {args.repeats} passed {metrics['pass_all_k']:.0%} of questions"
@@ -384,122 +386,77 @@ def run_trial(
         "num_repeats": args.repeats,
     }
 
-    if args.scheme == "per-question":
-        return run_sweep(
-            args,
-            harness,
-            prompt,
-            dataset,
+    base_name = f"{prompt.name}-v{prompt.version}-{harness.name}-{stamp}"
+    per_question = args.scheme == "per-question"
+    # Each group of questions is one evaluation run: (run name, tags, params, records).
+    groups = []
+    if per_question:
+        for record in records:
+            name, index = question_name(record), question_index(record)
+            # Tagged so the question runs filter out with `tags.run_type = 'question'`, and
+            # a sweep's or a question's with `tags.sweep` or `tags.question`.
+            groups.append((
+                f"{args.run_name}-{name}" if args.run_name else f"{name}-{base_name}",
+                {"run_type": "question", "question": name, "question_index": index, "sweep": trial_id},
+                {
+                    "sweep": trial_id,
+                    "question_name": name,
+                    "question_index": index,
+                    "dataset_record_id": record["dataset_record_id"],
+                    "num_questions": 1,
+                },
+                [record],
+            ))
+    else:
+        # Tagged so the trial runs filter out with `tags.run_type = 'trial'`.
+        groups.append((
+            args.run_name or base_name,
+            {"run_type": "trial"},
+            {"question_filter": ",".join(args.question), "num_questions": len(records)},
             records,
-            variables,
-            tracking_uri,
-            sweep=trial_id,
-            trial_dir=trial_dir,
-            stamp=stamp,
-            params=params,
-            skill_names=skill_names,
-        )
+        ))
 
-    run_name = args.run_name or f"{prompt.name}-v{prompt.version}-{harness.name}-{stamp}"
-    # Tagged so the trial runs filter out with `tags.run_type = 'trial'`.
-    with eval_run(
-        args,
-        harness,
-        prompt,
-        dataset,
-        run_name,
-        tags={"run_type": "trial", "harness": harness.name},
-        params={
-            **params,
-            "question_filter": ",".join(args.question),
-            "num_questions": len(records),
-        },
-    ) as run:
-        summaries = []
-        for i, record in enumerate(records, 1):
-            name = question_name(record)
-            print(f"\n[{i}/{len(records)}] {name}")
-            summaries += run_question(
-                args, harness, prompt, record, variables, trial_dir, f"{name}/"
-            )
-
-        metrics = finish_run(summaries, skill_names)
-        print_run_summary(args, "trial", run, metrics, summaries, tracking_uri)
-
-    return metrics["total_completed"] == len(summaries)
-
-
-def run_sweep(
-    args: argparse.Namespace,
-    harness: Harness,
-    prompt,
-    dataset,
-    records: list[dict[str, Any]],
-    variables: dict[str, str],
-    tracking_uri: str,
-    sweep: str,
-    trial_dir: Path,
-    stamp: str,
-    params: dict[str, Any],
-    skill_names: list[str],
-) -> bool:
-    """Run each question as an evaluation run of its own, its repeats the run's traces and
-    its metrics rolled up over them; return whether every repeat completed.
-
-    The runs are tagged ``sweep=<sweep>``, so one invocation's runs filter out together.
-    """
     results = []
-    experiment_id = None
-    for i, record in enumerate(records, 1):
-        name = question_name(record)
-        record_tags = record["tags"] or {}
-        question_index = record_tags.get("question_index", "")
-        print(f"\n[{i}/{len(records)}] {name}")
-        run_name = (
-            f"{args.run_name}-{name}"
-            if args.run_name
-            else f"{name}-{prompt.name}-v{prompt.version}-{harness.name}-{stamp}"
-        )
-        # Tagged so the question runs filter out with `tags.run_type = 'question'`, and a
-        # sweep's or a question's with `tags.sweep` or `tags.question`.
+    i = 0
+    for run_name, tags, run_params, group in groups:
         with eval_run(
-            args,
-            harness,
-            prompt,
-            dataset,
-            run_name,
-            tags={
-                "run_type": "question",
-                "harness": harness.name,
-                "question": name,
-                "question_index": question_index,
-                "sweep": sweep,
-            },
-            params={
-                **params,
-                "sweep": sweep,
-                "question_name": name,
-                "question_index": question_index,
-                "dataset_record_id": record["dataset_record_id"],
-                "num_questions": 1,
-            },
+            args, harness, prompt, dataset, run_name, tags, {**params, **run_params}
         ) as run:
-            summaries = run_question(args, harness, prompt, record, variables, trial_dir, "")
-            metrics = finish_run(summaries, skill_names, spread_metrics(summaries))
-            print_run_summary(args, "run", run, metrics, summaries, tracking_uri)
-        experiment_id = run.info.experiment_id
-        results.append((name, summaries, metrics))
+            summaries = []
+            for record in group:
+                i += 1
+                name = question_name(record)
+                print(f"\n[{i}/{len(records)}] {name}")
+                artifact_root = "" if per_question else f"{name}/"
+                summaries += run_question(
+                    args, harness, prompt, record, variables, trial_dir, artifact_root
+                )
+            extra_metrics = spread_metrics(summaries) if per_question else {}
+            metrics, all_succeeded = finish_run(summaries, skill_names, extra_metrics)
+            print_run_summary(args, run, metrics, summaries, tracking_uri)
+        results.append((summaries, metrics, all_succeeded))
 
+    if per_question:
+        print_sweep_summary(args, trial_id, results, tracking_uri)
+    return all(all_succeeded for _, _, all_succeeded in results)
+
+
+def print_sweep_summary(
+    args: argparse.Namespace,
+    sweep: str,
+    results: list[tuple[list[dict[str, Any]], dict[str, float], bool]],
+    tracking_uri: str,
+) -> None:
+    """One line per question run of the sweep, with where to find them together."""
     print(f"\nsweep    : {sweep}  ({len(results)} question run{'s' if len(results) != 1 else ''})")
-    for name, summaries, metrics in results:
-        status = "ok  " if metrics["total_completed"] == len(summaries) else "FAIL"
+    for summaries, metrics, all_succeeded in results:
+        status = "ok  " if all_succeeded else "FAIL"
         skills = ",".join(sorted(set().union(*(s["skill_calls"] for s in summaries)))) or "-"
         print(
-            f"  {status} {metrics['total_correct']}/{len(summaries)} passed  {name:24} "
-            f"${metrics['total_cost_usd']:.4f}  {skills}"
+            f"  {status} {metrics['total_correct']}/{len(summaries)} passed  "
+            f"{summaries[0]['name']:24} ${metrics['total_cost_usd']:.4f}  {skills}"
         )
-    print(f"cost     : ${sum(metrics['total_cost_usd'] for _, _, metrics in results):.4f}")
-    print(f"ui       : {experiment_url(tracking_uri, experiment_id)}")
+    print(f"cost     : ${sum(metrics['total_cost_usd'] for _, metrics, _ in results):.4f}")
+    experiment = mlflow.get_experiment_by_name(args.experiment)
+    print(f"ui       : {experiment_url(tracking_uri, experiment.experiment_id)}")
     print(f"filter   : tags.sweep = '{sweep}'")
-
-    return all(metrics["total_completed"] == len(summaries) for _, summaries, metrics in results)
