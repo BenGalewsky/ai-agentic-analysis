@@ -8,14 +8,19 @@ A trial:
      workspace containing a snapshot of ``skills/`` and runs the agent harness in it
      as a subprocess - Claude Code (``claude -p``, the default) or opencode
      (``opencode run``) - streaming JSON events.
-  4. Logs the trial as one MLflow evaluation run - params, rolled-up metrics and
-     artifacts - with an MLflow trace per question, graded and annotated with the
-     record's expectations.
+  4. Logs to MLflow, with an MLflow trace per repeat of each question, graded and
+     annotated with the record's expectations. ``--scheme`` picks the runs they go on:
+       omnibus       one evaluation run for the whole trial (the default), to compare
+                     skills or prompt changes across the benchmark
+       per-question  an evaluation run per question, its repeats as the run's traces,
+                     to dig into one question; the runs of one invocation share a
+                     ``sweep`` tag, and go to ``hep-plot-agent-questions`` by default
 
 Example:
     uv run run-trial
     uv run run-trial --question JetPtAll
     uv run run-trial --question JetPtAll --repeats 5
+    uv run run-trial --scheme per-question --question JetPtAll --repeats 5
     uv run run-trial --prompt IRIS-HEP --prompt-version 1 --model opus
     uv run run-trial --harness opencode --model lumen/qwen3-coder-next
 """
@@ -32,6 +37,7 @@ from .config import (
     DEFAULT_EXPERIMENT,
     DEFAULT_MCP_CONFIG,
     DEFAULT_PROMPT,
+    DEFAULT_QUESTION_EXPERIMENT,
     DEFAULT_TRIALS_DIR,
     connect_mlflow,
 )
@@ -89,11 +95,30 @@ def parse_args() -> argparse.Namespace:
         metavar="KEY=VALUE",
         help="Value for a prompt template variable (repeatable; overrides the dataset's inputs)",
     )
-    parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
+    parser.add_argument(
+        "--scheme",
+        default="omnibus",
+        choices=["omnibus", "per-question"],
+        help="omnibus: one evaluation run for the whole trial (default); per-question: an "
+        "evaluation run per question, its repeats as the run's traces",
+    )
+    parser.add_argument(
+        "--experiment",
+        default=None,
+        help=f"MLflow experiment to log to (default: {DEFAULT_EXPERIMENT}, or "
+        f"{DEFAULT_QUESTION_EXPERIMENT} with --scheme per-question)",
+    )
+    parser.add_argument(
+        "--dataset-experiment",
+        default=DEFAULT_EXPERIMENT,
+        help=f"Experiment the dataset is linked to (default: {DEFAULT_EXPERIMENT})",
+    )
     parser.add_argument(
         "--run-name",
         default=None,
-        help="Name of the parent trial run (default: <prompt>-v<version>-<harness>-<timestamp>)",
+        help="Name of the trial run (default: <prompt>-v<version>-<harness>-<timestamp>); "
+        "with --scheme per-question, a prefix for each question run's name (default: "
+        "<question>-<prompt>-v<version>-<harness>-<timestamp>)",
     )
     parser.add_argument(
         "--harness",
@@ -163,8 +188,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.experiment is None:
+        args.experiment = (
+            DEFAULT_QUESTION_EXPERIMENT if args.scheme == "per-question" else DEFAULT_EXPERIMENT
+        )
     tracking_uri = connect_mlflow()
-    mlflow.set_experiment(args.experiment)
 
     if args.no_mcp:
         args.mcp_config = []
@@ -177,7 +205,7 @@ def main() -> int:
 
     variables = dict(v.split("=", 1) for v in args.var)
     prompt = resolve_prompt(args.prompt, args.prompt_version)
-    dataset, records = load_questions(args.dataset, args.experiment)
+    dataset, records = load_questions(args.dataset, args.dataset_experiment)
     if args.question:
         records = [select_question(records, key) for key in args.question]
     if args.limit is not None:
@@ -186,4 +214,5 @@ def main() -> int:
     for record in records:
         render_prompt(prompt, {**record["inputs"], **variables})
 
+    mlflow.set_experiment(args.experiment)
     return 0 if run_trial(args, harness, prompt, dataset, records, variables, tracking_uri) else 1
